@@ -175,7 +175,19 @@ def _reduce_training_rtc_loss(
 
 
 # Define the complete layer computation function for gradient checkpointing
-def compute_layer_complete(inputs_embeds, attention_mask, position_ids, adarms_cond, layers, rotary_emb):
+def compute_layer_complete(
+    inputs_embeds,
+    attention_mask,
+    position_ids,
+    adarms_cond,
+    layers,
+    rotary_emb,
+    fast_adapter=None,
+    fast_tokens=None,
+    fast_delays=None,
+    fast_flow_times=None,
+    fast_observation_ages=None,
+):
     query_states = []
     key_states = []
     value_states = []
@@ -233,6 +245,14 @@ def compute_layer_complete(inputs_embeds, attention_mask, position_ids, adarms_c
         out_emb = layer.self_attn.o_proj(att_output[:, start_pos:end_pos])
         # first residual
         out_emb = _gated_residual(hidden_states, out_emb, gates[i])
+        if i == 1 and fast_adapter is not None:
+            out_emb = fast_adapter(
+                out_emb,
+                fast_tokens,
+                delays=fast_delays,
+                flow_times=fast_flow_times,
+                observation_ages=fast_observation_ages,
+            )
         after_first_residual = out_emb.clone()
         out_emb, gate = layernorm_forward(layer.post_attention_layernorm, out_emb, adarms_cond[i])
         # Convert to bfloat16 if the next layer (mlp) uses bfloat16
@@ -424,6 +444,11 @@ class PaliGemmaWithExpertModel(
         inputs_embeds: list[torch.FloatTensor] | None = None,
         use_cache: bool | None = None,
         adarms_cond: list[torch.Tensor] | None = None,
+        fast_adapters: nn.ModuleDict | None = None,
+        fast_tokens: torch.Tensor | None = None,
+        fast_delays: torch.Tensor | None = None,
+        fast_flow_times: torch.Tensor | None = None,
+        fast_observation_ages: torch.Tensor | None = None,
     ):
         if adarms_cond is None:
             adarms_cond = [None, None]
@@ -464,7 +489,13 @@ class PaliGemmaWithExpertModel(
             ) or (hasattr(self, "gradient_checkpointing") and self.gradient_checkpointing and self.training)
 
             # Process all layers with gradient checkpointing if enabled
-            for layers in zip(paligemma_layers, gemma_expert_layers, strict=True):
+            for layer_index, layers in enumerate(zip(paligemma_layers, gemma_expert_layers, strict=True)):
+                adapter_key = str(layer_index)
+                fast_adapter = (
+                    None
+                    if fast_adapters is None or adapter_key not in fast_adapters
+                    else fast_adapters[adapter_key]
+                )
                 if use_gradient_checkpointing:
                     inputs_embeds = torch.utils.checkpoint.checkpoint(
                         compute_layer_complete,
@@ -476,6 +507,11 @@ class PaliGemmaWithExpertModel(
                         preserve_rng_state=False,
                         layers=layers,
                         rotary_emb=rotary_emb,
+                        fast_adapter=fast_adapter,
+                        fast_tokens=fast_tokens,
+                        fast_delays=fast_delays,
+                        fast_flow_times=fast_flow_times,
+                        fast_observation_ages=fast_observation_ages,
                     )
                 else:
                     inputs_embeds = compute_layer_complete(
@@ -485,6 +521,11 @@ class PaliGemmaWithExpertModel(
                         adarms_cond,
                         layers=layers,
                         rotary_emb=rotary_emb,
+                        fast_adapter=fast_adapter,
+                        fast_tokens=fast_tokens,
+                        fast_delays=fast_delays,
+                        fast_flow_times=fast_flow_times,
+                        fast_observation_ages=fast_observation_ages,
                     )
 
             # final norm
@@ -703,23 +744,22 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
 
         return action_emb, pad_masks, att_masks, adarms_cond
 
-    def forward(
+    def predict_velocity(
         self,
         images,
         img_masks,
         tokens,
         masks,
-        actions,
-        noise,
-        time,
-        prefix_mask: Tensor | None = None,
+        x_t,
+        model_time,
         states=None,
         state_masks=None,
+        fast_adapters: nn.ModuleDict | None = None,
+        fast_tokens: Tensor | None = None,
+        fast_delays: Tensor | None = None,
+        fast_observation_ages: Tensor | None = None,
     ) -> Tensor:
-        """Do a full training forward pass and compute the loss."""
-        x_t, model_time = _build_flow_matching_inputs(actions, noise, time, prefix_mask)
-        u_t = noise - actions
-
+        """Predict the PI0.5 velocity for an explicitly supplied flow particle."""
         prefix_embs, prefix_pad_masks, prefix_att_masks = self.embed_prefix(
             images, img_masks, tokens, masks, states, state_masks
         )
@@ -748,6 +788,13 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
                 inputs_embeds=[prefix_embs, suffix_embs],
                 use_cache=False,
                 adarms_cond=[None, adarms_cond],
+                fast_adapters=fast_adapters,
+                fast_tokens=fast_tokens,
+                fast_delays=fast_delays,
+                fast_flow_times=(
+                    model_time if model_time.ndim == 1 else model_time.max(dim=1).values
+                ),
+                fast_observation_ages=fast_observation_ages,
             )
             return suffix_out
 
@@ -761,9 +808,71 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
         def action_out_proj_func(suffix_out):
             return self.action_out_proj(suffix_out)
 
-        v_t = self._apply_checkpoint(action_out_proj_func, suffix_out)
+        return self._apply_checkpoint(action_out_proj_func, suffix_out)
+
+    def forward(
+        self,
+        images,
+        img_masks,
+        tokens,
+        masks,
+        actions,
+        noise,
+        time,
+        prefix_mask: Tensor | None = None,
+        states=None,
+        state_masks=None,
+        fast_adapters: nn.ModuleDict | None = None,
+        fast_tokens: Tensor | None = None,
+        fast_delays: Tensor | None = None,
+        fast_observation_ages: Tensor | None = None,
+    ) -> Tensor:
+        """Do a full training forward pass and compute the loss."""
+        x_t, model_time = _build_flow_matching_inputs(actions, noise, time, prefix_mask)
+        u_t = noise - actions
+        v_t = self.predict_velocity(
+            images,
+            img_masks,
+            tokens,
+            masks,
+            x_t,
+            model_time,
+            states=states,
+            state_masks=state_masks,
+            fast_adapters=fast_adapters,
+            fast_tokens=fast_tokens,
+            fast_delays=fast_delays,
+            fast_observation_ages=fast_observation_ages,
+        )
 
         return F.mse_loss(u_t, v_t, reduction="none")
+
+    @torch.no_grad()  # see openpi `sample_actions` (slightly adapted)
+    def prepare_prefix_cache(
+        self,
+        images,
+        img_masks,
+        tokens,
+        masks,
+        states=None,
+        state_masks=None,
+    ):
+        """Embed the fixed slow condition once and return its reusable KV cache."""
+        prefix_embs, prefix_pad_masks, prefix_att_masks = self.embed_prefix(
+            images, img_masks, tokens, masks, states, state_masks
+        )
+        prefix_att_2d_masks = make_att_2d_masks(prefix_pad_masks, prefix_att_masks)
+        prefix_position_ids = torch.cumsum(prefix_pad_masks, dim=1) - 1
+        prefix_att_2d_masks_4d = prepare_attention_masks_4d(prefix_att_2d_masks)
+        self.paligemma_with_expert.paligemma.model.language_model.config._attn_implementation = "eager"  # noqa: SLF001
+        _, past_key_values = self.paligemma_with_expert.forward(
+            attention_mask=prefix_att_2d_masks_4d,
+            position_ids=prefix_position_ids,
+            past_key_values=None,
+            inputs_embeds=[prefix_embs, None],
+            use_cache=True,
+        )
+        return prefix_embs, prefix_pad_masks, past_key_values
 
     @torch.no_grad()  # see openpi `sample_actions` (slightly adapted)
     def sample_actions(
@@ -794,21 +903,8 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
             )  # Use config max_action_dim for internal processing
             noise = self.sample_noise(actions_shape, device)
 
-        prefix_embs, prefix_pad_masks, prefix_att_masks = self.embed_prefix(
+        _, prefix_pad_masks, past_key_values = self.prepare_prefix_cache(
             images, img_masks, tokens, masks, states, state_masks
-        )
-        prefix_att_2d_masks = make_att_2d_masks(prefix_pad_masks, prefix_att_masks)
-        prefix_position_ids = torch.cumsum(prefix_pad_masks, dim=1) - 1
-
-        prefix_att_2d_masks_4d = prepare_attention_masks_4d(prefix_att_2d_masks)
-        self.paligemma_with_expert.paligemma.model.language_model.config._attn_implementation = "eager"  # noqa: SLF001
-
-        _, past_key_values = self.paligemma_with_expert.forward(
-            attention_mask=prefix_att_2d_masks_4d,
-            position_ids=prefix_position_ids,
-            past_key_values=None,
-            inputs_embeds=[prefix_embs, None],
-            use_cache=True,
         )
 
         rtc_mode = "guided"
@@ -853,6 +949,10 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
         past_key_values,
         x_t,
         timestep,
+        fast_adapters: nn.ModuleDict | None = None,
+        fast_tokens: Tensor | None = None,
+        fast_delays: Tensor | None = None,
+        fast_observation_ages: Tensor | None = None,
     ):
         """Apply one denoising step of the noise `x_t` at a given timestep."""
         suffix_embs, suffix_pad_masks, suffix_att_masks, adarms_cond = self.embed_suffix(x_t, timestep)
@@ -879,6 +979,11 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
             inputs_embeds=[None, suffix_embs],
             use_cache=False,
             adarms_cond=[None, adarms_cond],
+            fast_adapters=fast_adapters,
+            fast_tokens=fast_tokens,
+            fast_delays=fast_delays,
+            fast_flow_times=timestep,
+            fast_observation_ages=fast_observation_ages,
         )
 
         suffix_out = outputs_embeds[1]
@@ -1190,6 +1295,7 @@ class PI05Policy(PreTrainedPolicy):
         # Preprocess image features present in the batch
         for key in present_img_keys:
             img = batch[key]
+            was_uint8 = img.dtype == torch.uint8
 
             # Ensure tensor is on the same device as the model
             if img.device != device:
@@ -1198,6 +1304,8 @@ class PI05Policy(PreTrainedPolicy):
             # Ensure float32 dtype for consistency
             if img.dtype != torch.float32:
                 img = img.to(torch.float32)
+            if was_uint8:
+                img = img / 255.0
 
             # Handle [B,C,H,W], [B,H,W,C], and their [B,T,...] memory variants.
             is_video = img.ndim == 5

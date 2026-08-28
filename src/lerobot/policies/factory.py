@@ -238,6 +238,12 @@ def make_pre_post_processors(
             revision=pretrained_revision,
         )
         _reconnect_relative_absolute_steps(preprocessor, postprocessor)
+        processor_module_path = policy_cfg.__class__.__module__.replace("configuration_", "processor_")
+        processor_module = importlib.import_module(processor_module_path)
+        reconcile_name = f"reconcile_{policy_cfg.type}_pretrained_processors"
+        reconcile = getattr(processor_module, reconcile_name, None)
+        if reconcile is not None:
+            preprocessor, postprocessor = reconcile(policy_cfg, preprocessor, postprocessor)
         if isinstance(policy_cfg, Evo1Config):
             from .evo1.processor_evo1 import reconcile_evo1_processors
 

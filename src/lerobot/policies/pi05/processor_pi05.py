@@ -52,6 +52,7 @@ class Pi05PrepareStateTokenizerProcessorStep(ProcessorStep):
     # backbone instead of discretized prompt tokens, so the state is carried once.
     # Set from `PI05Config.use_proprioceptive_memory`; stock PI0.5 keeps it in the prompt.
     include_state_in_prompt: bool = True
+    temporal_index: int = -1
 
     def __call__(self, transition: EnvTransition) -> EnvTransition:
         transition = transition.copy()
@@ -70,7 +71,7 @@ class Pi05PrepareStateTokenizerProcessorStep(ProcessorStep):
         if self.include_state_in_prompt:
             # State should already be normalized to [-1, 1] by the NormalizerProcessorStep that runs before this step
             # Discretize into 256 bins (see openpi `PaligemmaTokenizer.tokenize()`)
-            prompt_state = state[:, -1] if state.ndim == 3 else state
+            prompt_state = state[:, self.temporal_index] if state.ndim == 3 else state
             state_np = prompt_state.cpu().numpy()
             discretized_states = np.digitize(state_np, bins=np.linspace(-1, 1, 256 + 1)[:-1]) - 1
 
@@ -149,9 +150,10 @@ def make_pi05_pre_post_processors(
         Pi05PrepareStateTokenizerProcessorStep(
             max_state_dim=config.max_state_dim,
             include_state_in_prompt=not config.use_proprioceptive_memory,
+            temporal_index=int(getattr(config, "prompt_state_temporal_index", -1)),
         ),
         TokenizerProcessorStep(
-            tokenizer_name="google/paligemma-3b-pt-224",
+            tokenizer_name=config.tokenizer_name,
             max_length=config.tokenizer_max_length,
             padding_side="right",
             padding="max_length",

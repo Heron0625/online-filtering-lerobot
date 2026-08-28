@@ -511,6 +511,10 @@ def train(cfg: TrainPipelineConfig):
             },
             "rename_observations_processor": {"rename_map": cfg.rename_map},
         }
+        if hasattr(active_cfg, "tokenizer_name"):
+            preprocessor_overrides["tokenizer_processor"] = {
+                "tokenizer_name": active_cfg.tokenizer_name
+            }
         postprocessor_overrides = {
             "unnormalizer_processor": {
                 "features": policy.config.output_features,
