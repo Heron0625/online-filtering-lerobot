@@ -512,9 +512,7 @@ def train(cfg: TrainPipelineConfig):
             "rename_observations_processor": {"rename_map": cfg.rename_map},
         }
         if hasattr(active_cfg, "tokenizer_name"):
-            preprocessor_overrides["tokenizer_processor"] = {
-                "tokenizer_name": active_cfg.tokenizer_name
-            }
+            preprocessor_overrides["tokenizer_processor"] = {"tokenizer_name": active_cfg.tokenizer_name}
         postprocessor_overrides = {
             "unnormalizer_processor": {
                 "features": policy.config.output_features,
@@ -626,6 +624,13 @@ def train(cfg: TrainPipelineConfig):
     dl_iter = cycle(dataloader)
     policy.train()
 
+    # Online-flow Phase 2 needs a full per-rank EMA teacher during the forward pass. It is kept
+    # outside module registration so DDP, the optimizer, and student checkpoints only see the
+    # student. Initialize here, after pretrained weights and distributed preparation are complete.
+    unwrapped_policy = accelerator.unwrap_model(policy)
+    if hasattr(unwrapped_policy, "initialize_online_flow_teacher"):
+        unwrapped_policy.initialize_online_flow_teacher()
+
     # EMA shadow of the policy weights (Chi et al. 2023, Diffusion Policy, section V.D). The shadow
     # lives on the main process only, which is safe under DDP where every rank holds identical
     # weights after each gradient sync. diffusers is imported lazily so the base training path does
@@ -685,12 +690,15 @@ def train(cfg: TrainPipelineConfig):
                         ema_path,
                     )
 
+    # Stage-B endpoint and delta losses are often in the 1e-6--1e-4 range. Scientific notation
+    # keeps the optimized loss visible; Stage-A retains the familiar fixed-point display.
+    loss_format = ":.3e" if getattr(cfg.policy, "training_stage", None) == "stage_b" else ":.3f"
     train_metrics = {
         # Per-rank loss reflects only one shard of the global batch; mean recovers the loss the
         # data-parallel group is actually optimizing. grad_norm and lr are already identical on
         # every rank (post gradient sync / deterministic scheduler) so reducing them would be a
         # no-op collective.
-        "loss": AverageMeter("loss", ":.3f", reduction="mean"),
+        "loss": AverageMeter("loss", loss_format, reduction="mean"),
         "grad_norm": AverageMeter("grdn", ":.3f"),
         "lr": AverageMeter("lr", ":0.1e"),
         # Report the slowest rank for bottleneck-style timings so multi-GPU runs surface the
@@ -729,6 +737,9 @@ def train(cfg: TrainPipelineConfig):
 
     for _ in range(step, cfg.steps):
         step_start = time.perf_counter()
+        unwrapped_policy = accelerator.unwrap_model(policy)
+        if hasattr(unwrapped_policy, "set_training_step"):
+            unwrapped_policy.set_training_step(step)
         batch = next(dl_iter)
         preprocessing_start = time.perf_counter()
         train_tracker.dataloading_s = preprocessing_start - step_start
@@ -752,6 +763,10 @@ def train(cfg: TrainPipelineConfig):
         # gradient accumulation.
         if ema is not None and accelerator.sync_gradients:
             ema.step(accelerator.unwrap_model(policy).parameters())
+        if accelerator.sync_gradients:
+            unwrapped_policy = accelerator.unwrap_model(policy)
+            if hasattr(unwrapped_policy, "update_online_flow_teacher"):
+                unwrapped_policy.update_online_flow_teacher()
 
         # Note: eval and checkpoint happens *after* the `step`th training update has completed, so we
         # increment `step` here.

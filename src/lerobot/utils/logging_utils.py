@@ -24,6 +24,18 @@ from .utils import format_big_number
 _VALID_REDUCTIONS = ("none", "max", "mean", "sum")
 
 
+def _metric_format(name: str) -> str:
+    """Choose a readable format for dynamically registered scalar metrics.
+
+    Endpoint and delta MSE values are commonly much smaller than one, so fixed three-decimal
+    formatting silently renders useful values as ``0.000``. Keep ordinary metrics compact while
+    exposing these diagnostic losses in scientific notation.
+    """
+    if name.endswith("_mse") or name.endswith("_endpoint_loss"):
+        return ":.3e"
+    return ":.3f"
+
+
 class AverageMeter:
     """
     Computes and stores the average and current value
@@ -193,7 +205,7 @@ class MetricsTracker:
             if name in self._caller_metrics:
                 continue
             if name not in self.metrics:
-                self.metrics[name] = AverageMeter(name, ":.3f", reduction="mean")
+                self.metrics[name] = AverageMeter(name, _metric_format(name), reduction="mean")
             self.metrics[name].update(float(value))
 
     def reduce_across_ranks(self) -> None:

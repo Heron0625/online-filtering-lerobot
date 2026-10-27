@@ -772,6 +772,13 @@ def eval_main(cfg: EvalPipelineConfig):
         "device_processor": {"device": str(policy.config.device)},
         "rename_observations_processor": {"rename_map": cfg.rename_map},
     }
+    # A local tokenizer path supplied through the policy config must also override
+    # the tokenizer name serialized in policy_preprocessor.json.  This matters for
+    # offline/migrated checkpoints whose original tokenizer repo is gated.
+    if getattr(cfg.policy, "tokenizer_name", None):
+        preprocessor_overrides["tokenizer_processor"] = {
+            "tokenizer_name": cfg.policy.tokenizer_name,
+        }
 
     preprocessor, postprocessor = make_pre_post_processors(
         policy_cfg=cfg.policy,

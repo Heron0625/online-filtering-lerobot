@@ -84,6 +84,8 @@ class FastObservationPacket:
     proprio: Tensor
     camera_valid_mask: Tensor
     generation: int
+    # Actions issued since chunk trigger, in policy-normalized action coordinates.
+    executed_prefix: Tensor | None = None
 
 
 class FastObservationBuffer:
@@ -203,6 +205,7 @@ class FastObservationRequest:
     capture_timestamp: float
     generation: int
     camera_valid_mask: Tensor
+    executed_prefix: Tensor | None = None
 
 
 class OnlineFilteringRuntime:
@@ -243,6 +246,7 @@ class OnlineFilteringRuntime:
             capture_timestamp=request.capture_timestamp,
             generation=request.generation,
             camera_valid_mask=request.camera_valid_mask,
+            executed_prefix=request.executed_prefix,
         )
 
     def begin_chunk(self) -> int:
@@ -261,6 +265,7 @@ class OnlineFilteringRuntime:
         capture_step: int,
         capture_timestamp: float,
         camera_valid_mask: Tensor,
+        executed_prefix: Tensor | None = None,
     ) -> None:
         if self._generation is None:
             raise RuntimeError("begin_chunk must be called before submitting observations")
@@ -273,6 +278,7 @@ class OnlineFilteringRuntime:
                 capture_timestamp=capture_timestamp,
                 generation=self._generation,
                 camera_valid_mask=camera_valid_mask,
+                executed_prefix=executed_prefix,
             )
         )
 
@@ -497,6 +503,18 @@ def masked_suffix_mean(losses: Tensor, free_mask: Tensor) -> Tensor:
     return (losses * expanded).sum() / denominator
 
 
+def hard_commit_action_prefix(particle: Tensor, executed_actions: Tensor, delays: Tensor) -> Tensor:
+    """Replace elapsed action coordinates with the actions actually executed."""
+    if particle.shape != executed_actions.shape or particle.ndim != 3:
+        raise ValueError(
+            "particle and executed_actions must have the same (batch, horizon, action_dim) shape"
+        )
+    if delays.shape != particle.shape[:1] or torch.any((delays < 0) | (delays > particle.shape[1])):
+        raise ValueError("delays must be a valid per-example prefix length")
+    committed = torch.arange(particle.shape[1], device=particle.device)[None, :, None] < delays[:, None, None]
+    return torch.where(committed, executed_actions.to(particle), particle)
+
+
 class FastTokenResampler(nn.Module):
     """Compress multi-camera initial/current DINO patch features into fast tokens."""
 
@@ -508,6 +526,7 @@ class FastTokenResampler(nn.Module):
         num_heads: int = 8,
         num_cameras: int = 2,
         state_dim: int = 0,
+        spatial_tokens: bool = False,
     ) -> None:
         super().__init__()
         if output_dim % num_heads != 0:
@@ -516,6 +535,12 @@ class FastTokenResampler(nn.Module):
         self.output_dim = output_dim
         self.num_fast_tokens = num_fast_tokens
         self.num_cameras = num_cameras
+        self.spatial_tokens = spatial_tokens
+        if spatial_tokens:
+            if num_fast_tokens % num_cameras:
+                raise ValueError("visual token count must be divisible by camera count")
+            self.position_proj = nn.Linear(2, output_dim)
+            self.modality_embedding = nn.Parameter(torch.zeros(2, output_dim))
 
         self.feature_proj = nn.Linear(3 * feature_dim, output_dim)
         self.camera_embedding = nn.Parameter(torch.zeros(num_cameras, output_dim))
@@ -532,7 +557,9 @@ class FastTokenResampler(nn.Module):
             if state_dim > 0
             else None
         )
-        self.delay_proj = nn.Sequential(nn.Linear(1, output_dim), nn.SiLU(), nn.Linear(output_dim, output_dim))
+        self.delay_proj = nn.Sequential(
+            nn.Linear(1, output_dim), nn.SiLU(), nn.Linear(output_dim, output_dim)
+        )
 
     def forward(
         self,
@@ -570,6 +597,42 @@ class FastTokenResampler(nn.Module):
         )
         tokens = self.feature_proj(residual_features)
         tokens = tokens + self.camera_embedding[None, :, None, :].to(tokens.dtype)
+        if self.spatial_tokens:
+            side = int(patches**0.5)
+            if side * side != patches:
+                raise ValueError("spatial resampler requires a square patch grid")
+            axis = torch.linspace(-1, 1, side, device=tokens.device, dtype=tokens.dtype)
+            yy, xx = torch.meshgrid(axis, axis, indexing="ij")
+            coords = torch.stack([xx, yy], dim=-1).reshape(patches, 2)
+            tokens = tokens + self.position_proj(coords)[None, None]
+            queries = self.queries.reshape(cameras, -1, self.output_dim)[None].expand(batch_size, -1, -1, -1)
+            queries = (
+                queries
+                + self.camera_embedding[None, :, None]
+                + self.delay_proj(delays.to(tokens.dtype)[:, None])[:, None, None]
+            )
+            camera_mask = (
+                None if patch_mask is None else ~patch_mask.reshape(batch_size * cameras, patches).bool()
+            )
+            output, _ = self.cross_attention(
+                queries.reshape(batch_size * cameras, -1, self.output_dim),
+                tokens.reshape(batch_size * cameras, patches, self.output_dim),
+                tokens.reshape(batch_size * cameras, patches, self.output_dim),
+                key_padding_mask=camera_mask,
+            )
+            visual = self.output_norm(
+                queries.reshape(batch_size, -1, self.output_dim)
+                + output.reshape(batch_size, -1, self.output_dim)
+            )
+            visual = visual + self.modality_embedding[0]
+            if self.state_proj is None or states is None:
+                raise ValueError("spatial fast branch requires proprioception")
+            proprio = (
+                self.state_proj(states)
+                + self.delay_proj(delays.to(tokens.dtype)[:, None])
+                + self.modality_embedding[1]
+            )
+            return torch.cat([visual, proprio[:, None]], dim=1)
         tokens = tokens.reshape(batch_size, cameras * patches, self.output_dim)
 
         key_padding_mask = None
@@ -633,7 +696,9 @@ class FastObservationAdapter(nn.Module):
         )
         positions = torch.arange(horizon, device=action_hidden.device).unsqueeze(0)
         relative_position = (positions - delays.unsqueeze(1)).clamp(min=0).to(action_hidden.dtype)
-        relative_position = relative_position / (horizon - delays).clamp(min=1).unsqueeze(1).to(action_hidden.dtype)
+        relative_position = relative_position / (horizon - delays).clamp(min=1).unsqueeze(1).to(
+            action_hidden.dtype
+        )
         gate_inputs = torch.stack(
             [
                 flow_times.to(action_hidden.dtype).unsqueeze(1).expand(-1, horizon),
@@ -643,7 +708,10 @@ class FastObservationAdapter(nn.Module):
             dim=-1,
         )
         gate = torch.sigmoid(self.gate_mlp(gate_inputs))
-        correction = self.output_proj(correction) * gate
+        # The observation captured at physical step d cannot rewrite actions already executed
+        # at positions 0..d-1.  Use the same delay that conditions the gate as a hard mask.
+        available = positions >= delays.unsqueeze(1)
+        correction = self.output_proj(correction) * gate * available.unsqueeze(-1)
         return action_hidden + correction
 
 
@@ -670,7 +738,7 @@ class ConditionTokenResampler(nn.Module):
 
 
 class PosteriorResidualUpdater(nn.Module):
-    """One-step student that predicts a masked posterior-particle residual."""
+    """One-step condition-switch transport with explicit prefix-transition and residual gates."""
 
     def __init__(
         self,
@@ -679,13 +747,19 @@ class PosteriorResidualUpdater(nn.Module):
         num_heads: int = 8,
         num_layers: int = 2,
         max_horizon: int = 50,
+        use_learned_gate: bool = True,
     ) -> None:
         super().__init__()
         self.action_dim = action_dim
         self.max_horizon = max_horizon
+        self.use_learned_gate = use_learned_gate
         self.action_in = nn.Linear(action_dim, hidden_dim)
         self.condition_in = nn.Linear(5, hidden_dim)
         self.position_embedding = nn.Parameter(torch.randn(max_horizon, hidden_dim) * 0.02)
+        # Mark actions that were already committed before this packet separately from
+        # actions committed while the packet was in flight. This makes Delta-A visible
+        # without asking the transformer to infer a boundary solely from scalar delays.
+        self.prefix_phase_embedding = nn.Embedding(3, hidden_dim)
         layer = nn.TransformerEncoderLayer(
             d_model=hidden_dim,
             nhead=num_heads,
@@ -697,6 +771,9 @@ class PosteriorResidualUpdater(nn.Module):
         self.context_attention = nn.MultiheadAttention(hidden_dim, num_heads, batch_first=True)
         self.context_norm = nn.LayerNorm(hidden_dim)
         self.output = nn.Linear(hidden_dim, action_dim)
+        # One gate for every action-horizon location. Prefix positions are hard-masked.
+        self.residual_gate = nn.Linear(hidden_dim, 1)
+        self.residual_gate.requires_grad_(use_learned_gate)
         nn.init.zeros_(self.output.weight)
         nn.init.zeros_(self.output.bias)
 
@@ -709,7 +786,9 @@ class PosteriorResidualUpdater(nn.Module):
         flow_times: Tensor,
         observation_ages: Tensor | None = None,
         condition_tokens: Tensor | None = None,
-    ) -> Tensor:
+        executed_actions: Tensor | None = None,
+        return_gate: bool = False,
+    ) -> Tensor | tuple[Tensor, Tensor]:
         batch_size, horizon, action_dim = old_particle.shape
         if horizon > self.max_horizon or action_dim != self.action_dim:
             raise ValueError("old_particle shape is incompatible with updater configuration")
@@ -717,6 +796,8 @@ class PosteriorResidualUpdater(nn.Module):
             raise ValueError("old_delays and new_delays must have shape (batch,)")
         if observation_ages is None:
             observation_ages = torch.zeros_like(flow_times)
+        if executed_actions is not None:
+            old_particle = hard_commit_action_prefix(old_particle, executed_actions, new_delays)
         gap = new_delays - old_delays
         condition = torch.stack(
             [
@@ -728,7 +809,14 @@ class PosteriorResidualUpdater(nn.Module):
             ],
             dim=-1,
         )
+        positions = torch.arange(horizon, device=old_particle.device)[None, :]
+        phase = torch.where(
+            positions < old_delays[:, None],
+            0,
+            torch.where(positions < new_delays[:, None], 1, 2),
+        )
         hidden = self.action_in(old_particle) + self.position_embedding[None, :horizon]
+        hidden = hidden + self.prefix_phase_embedding(phase)
         hidden = hidden + self.condition_in(condition).unsqueeze(1)
         hidden = self.transformer(hidden)
         if condition_tokens is not None:
@@ -736,5 +824,25 @@ class PosteriorResidualUpdater(nn.Module):
                 raise ValueError("condition_tokens must have shape (batch, tokens, hidden_dim)")
             context, _ = self.context_attention(hidden, condition_tokens, condition_tokens)
             hidden = self.context_norm(hidden + context)
-        residual = self.output(hidden)
-        return old_particle + residual
+        # The updater is also used in component tests without a physical prefix.
+        # Only hard-mask locations when concrete executed actions were supplied.
+        available = (
+            positions >= new_delays[:, None]
+            if executed_actions is not None
+            else torch.ones_like(positions, dtype=torch.bool)
+        )
+        if self.use_learned_gate:
+            gate = torch.sigmoid(self.residual_gate(hidden)).squeeze(-1)
+        else:
+            # Hard prefix availability is the only gate needed while learning the
+            # transport.  A learned multiplicative gate gives the residual head a
+            # second, poorly identified way to shrink an already tiny target.
+            gate = torch.ones((batch_size, horizon), device=hidden.device, dtype=hidden.dtype)
+        gate = gate * available.to(gate.dtype)
+        residual = self.output(hidden) * gate.unsqueeze(-1)
+        updated = old_particle + residual
+        if executed_actions is not None:
+            updated = hard_commit_action_prefix(updated, executed_actions, new_delays)
+        if return_gate:
+            return updated, gate
+        return updated

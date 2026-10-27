@@ -1,0 +1,5 @@
+benchmark_root: /data/yhr/anaconda/anaconda3/envs/online_filtering/lib/python3.12/site-packages/libero/libero
+bddl_files: /data/yhr/anaconda/anaconda3/envs/online_filtering/lib/python3.12/site-packages/libero/libero/bddl_files
+init_states: /data/yhr/anaconda/anaconda3/envs/online_filtering/lib/python3.12/site-packages/libero/libero/init_files
+datasets: /data/zhoukai/dataset/libero
+assets: /data/zhoukai/dataset/libero-assets

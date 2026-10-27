@@ -219,6 +219,15 @@ def test_metrics_tracker_update_metrics_registers_and_averages():
     assert tracker.to_dict()["latent_loss"] == pytest.approx(0.3)
 
 
+def test_metrics_tracker_uses_scientific_format_for_small_mse_diagnostics():
+    tracker = MetricsTracker(batch_size=1, num_frames=10, num_episodes=1, metrics={})
+    tracker.update_metrics({"teacher_delta_mse": 2.31e-6, "student_delta_mse": 4.2e-5})
+
+    assert tracker.metrics["teacher_delta_mse"].fmt == ":.3e"
+    assert tracker.metrics["student_delta_mse"].fmt == ":.3e"
+    assert str(tracker.metrics["teacher_delta_mse"]) == "teacher_delta_mse:2.310e-06"
+
+
 def test_metrics_tracker_update_metrics_skips_non_numeric():
     tracker = MetricsTracker(batch_size=32, num_frames=1000, num_episodes=50, metrics={})
     tracker.update_metrics({"loss": 0.5, "head_mode": "sparse", "enabled": True})

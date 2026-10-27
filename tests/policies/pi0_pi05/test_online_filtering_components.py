@@ -27,6 +27,7 @@ from lerobot.policies.pi05.online_filtering import (
     TimestampedFastTokenCache,
     build_overlap_timeline,
     build_stage_a_flow_inputs,
+    hard_commit_action_prefix,
     masked_suffix_mean,
     shared_base_teacher_pair,
 )
@@ -387,13 +388,13 @@ def test_zero_initialized_fast_adapter_is_identity():
     assert torch.equal(output, actions)
 
 
-def test_fast_adapter_can_update_the_complete_particle():
+def test_fast_adapter_updates_only_actions_after_observation():
     torch.manual_seed(0)
     adapter = FastObservationAdapter(hidden_dim=16, num_heads=4)
     torch.nn.init.normal_(adapter.output_proj.weight)
     actions = torch.randn(1, 8, 16)
     output = adapter(actions, torch.randn(1, 4, 16), delays=torch.tensor([3]), flow_times=torch.tensor([0.5]))
-    assert not torch.equal(output[:, :3], actions[:, :3])
+    assert torch.equal(output[:, :3], actions[:, :3])
     assert not torch.equal(output[:, 3:], actions[:, 3:])
 
 
@@ -410,6 +411,45 @@ def test_zero_initialized_posterior_updater_is_identity():
     assert torch.equal(output, particle)
 
 
+def test_posterior_updater_can_use_only_hard_availability_gate():
+    updater = PosteriorResidualUpdater(
+        action_dim=2, hidden_dim=16, num_heads=4, num_layers=1, use_learned_gate=False
+    )
+    torch.nn.init.constant_(updater.output.weight, 0.1)
+    particle = torch.randn(1, 8, 2)
+    executed = torch.randn_like(particle)
+    output, gate = updater(
+        particle,
+        old_delays=torch.tensor([1]),
+        new_delays=torch.tensor([4]),
+        flow_times=torch.tensor([0.5]),
+        executed_actions=executed,
+        return_gate=True,
+    )
+    assert torch.equal(gate[:, :4], torch.zeros(1, 4))
+    assert torch.equal(gate[:, 4:], torch.ones(1, 4))
+    assert torch.equal(output[:, :4], executed[:, :4])
+    assert not updater.residual_gate.weight.requires_grad
+
+
+def test_stage_b_updater_hard_commits_new_prefix() -> None:
+    updater = PosteriorResidualUpdater(action_dim=7, hidden_dim=32, num_heads=4, num_layers=1)
+    torch.nn.init.normal_(updater.output.weight)
+    particle = torch.randn(2, 8, 7)
+    executed = torch.randn_like(particle)
+    new_delays = torch.tensor([2, 5])
+    output = updater(
+        particle,
+        old_delays=torch.tensor([0, 2]),
+        new_delays=new_delays,
+        flow_times=torch.tensor([0.5, 0.3]),
+        executed_actions=executed,
+    )
+    for row, delay in enumerate(new_delays.tolist()):
+        assert torch.equal(output[row, :delay], executed[row, :delay])
+    assert torch.equal(hard_commit_action_prefix(particle, executed, new_delays)[:, :2], executed[:, :2])
+
+
 def test_posterior_updater_can_update_the_complete_particle():
     torch.manual_seed(0)
     updater = PosteriorResidualUpdater(action_dim=3, hidden_dim=16, num_heads=4, num_layers=1)
@@ -423,6 +463,30 @@ def test_posterior_updater_can_update_the_complete_particle():
     )
     assert not torch.equal(output, particle)
     assert not torch.equal(output[:, :2], particle[:, :2])
+
+
+def test_posterior_updater_exposes_prefix_transition_and_suffix_gate():
+    torch.manual_seed(5)
+    updater = PosteriorResidualUpdater(action_dim=2, hidden_dim=16, num_heads=4, num_layers=1)
+    torch.nn.init.normal_(updater.output.weight)
+    particle = torch.randn(2, 8, 2)
+    output, gate = updater(
+        particle,
+        old_delays=torch.tensor([1, 3]),
+        new_delays=torch.tensor([4, 6]),
+        flow_times=torch.tensor([0.4, 0.6]),
+        executed_actions=torch.randn_like(particle),
+        return_gate=True,
+    )
+    assert output.shape == particle.shape
+    assert gate.shape == particle.shape[:2]
+    assert torch.equal(gate[0, :4], torch.zeros(4))
+    assert torch.equal(gate[1, :6], torch.zeros(6))
+    assert torch.all((gate[:, :] >= 0) & (gate[:, :] <= 1))
+    assert updater.prefix_phase_embedding.weight.grad is None
+    output.square().mean().backward()
+    assert updater.prefix_phase_embedding.weight.grad is not None
+    assert updater.residual_gate.weight.grad is not None
 
 
 def test_posterior_updater_learns_synthetic_full_particle_transport():

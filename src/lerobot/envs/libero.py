@@ -27,12 +27,21 @@ import gymnasium as gym
 import numpy as np
 import torch
 from gymnasium import spaces
+import libero.libero as libero_resources
 from libero.libero import benchmark, get_libero_path
 from libero.libero.envs import OffScreenRenderEnv
 
 from lerobot.lerobot_types import RobotObservation
 
 from .utils import _LazyAsyncVectorEnv, parse_camera_names
+
+
+# Newer LIBERO releases keep the asset path in a process-local cache instead
+# of reading the legacy config entry.  Honour the explicit runtime override so
+# migrated/offline installations do not unexpectedly download the asset set.
+_assets_path_override = os.environ.get("LIBERO_ASSETS_PATH")
+if _assets_path_override and Path(_assets_path_override).is_dir():
+    libero_resources._assets_path_cache = _assets_path_override
 
 
 def _get_suite(name: str) -> benchmark.Benchmark:

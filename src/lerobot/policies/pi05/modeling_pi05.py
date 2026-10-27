@@ -155,6 +155,15 @@ def _build_flow_matching_inputs(
     return x_t, model_time
 
 
+def _mask_committed_queries_from_free_actions(attention: Tensor, delays: Tensor) -> Tensor:
+    """Prevent committed actions from reading free tokens carrying newer observations."""
+    horizon = attention.shape[-1]
+    positions = torch.arange(horizon, device=attention.device)
+    committed = positions[None, :] < delays[:, None]
+    free_keys = positions[None, :] >= delays[:, None]
+    return attention & ~(committed[:, :, None] & free_keys[:, None, :])
+
+
 def _reduce_training_rtc_loss(
     losses: Tensor,
     prefix_mask: Tensor | None,
@@ -648,7 +657,7 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
         )
 
     def embed_prefix(
-        self, images, img_masks, tokens, masks, states=None, state_masks=None
+        self, images, img_masks, tokens, masks, states=None, state_masks=None, slow_visual_masks=None
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """Embed images, optional MEM state history, and language tokens."""
         embs = []
@@ -656,7 +665,7 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
         att_masks = []
 
         # Process images
-        for img, img_mask in zip(images, img_masks, strict=True):
+        for camera_index, (img, img_mask) in enumerate(zip(images, img_masks, strict=True)):
 
             def image_embed_func(img, img_mask):
                 if img.ndim == 5:
@@ -672,7 +681,12 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
 
             embs.append(img_emb)
             current_img_mask = img_mask[:, -1] if img_mask.ndim == 2 else img_mask
-            pad_masks.append(current_img_mask[:, None].expand(bsize, num_img_embs))
+            visible = current_img_mask[:, None].expand(bsize, num_img_embs)
+            if slow_visual_masks is not None:
+                visible = visible & slow_visual_masks[camera_index]
+                img_emb = img_emb.masked_fill(~visible[:, :, None], 0)
+                embs[-1] = img_emb
+            pad_masks.append(visible)
             att_masks += [0] * num_img_embs
 
         proprio_history_proj = getattr(self, "proprio_history_proj", None)
@@ -758,10 +772,11 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
         fast_tokens: Tensor | None = None,
         fast_delays: Tensor | None = None,
         fast_observation_ages: Tensor | None = None,
+        slow_visual_masks: list[Tensor] | None = None,
     ) -> Tensor:
         """Predict the PI0.5 velocity for an explicitly supplied flow particle."""
         prefix_embs, prefix_pad_masks, prefix_att_masks = self.embed_prefix(
-            images, img_masks, tokens, masks, states, state_masks
+            images, img_masks, tokens, masks, states, state_masks, slow_visual_masks
         )
         suffix_embs, suffix_pad_masks, suffix_att_masks, adarms_cond = self.embed_suffix(x_t, model_time)
 
@@ -776,6 +791,12 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
         att_masks = torch.cat([prefix_att_masks, suffix_att_masks], dim=1)
 
         att_2d_masks = make_att_2d_masks(pad_masks, att_masks)
+        if fast_tokens is not None and fast_delays is not None:
+            # Committed action queries may read the slow prefix and committed actions, but
+            # not free suffix tokens that can already contain the newer fast observation.
+            horizon = suffix_pad_masks.shape[1]
+            action_block = att_2d_masks[:, -horizon:, -horizon:]
+            action_block &= _mask_committed_queries_from_free_actions(action_block, fast_delays)
         position_ids = torch.cumsum(pad_masks, dim=1) - 1
 
         att_2d_masks_4d = prepare_attention_masks_4d(att_2d_masks)
@@ -791,9 +812,7 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
                 fast_adapters=fast_adapters,
                 fast_tokens=fast_tokens,
                 fast_delays=fast_delays,
-                fast_flow_times=(
-                    model_time if model_time.ndim == 1 else model_time.max(dim=1).values
-                ),
+                fast_flow_times=(model_time if model_time.ndim == 1 else model_time.max(dim=1).values),
                 fast_observation_ages=fast_observation_ages,
             )
             return suffix_out
@@ -949,13 +968,60 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
         past_key_values,
         x_t,
         timestep,
+        prefix_embs=None,
         fast_adapters: nn.ModuleDict | None = None,
         fast_tokens: Tensor | None = None,
         fast_delays: Tensor | None = None,
         fast_observation_ages: Tensor | None = None,
+        committed_delays: Tensor | None = None,
     ):
         """Apply one denoising step of the noise `x_t` at a given timestep."""
-        suffix_embs, suffix_pad_masks, suffix_att_masks, adarms_cond = self.embed_suffix(x_t, timestep)
+        model_time = timestep
+        if committed_delays is not None:
+            positions = torch.arange(x_t.shape[1], device=x_t.device)[None, :]
+            model_time = torch.where(
+                positions < committed_delays[:, None],
+                torch.zeros_like(timestep[:, None]),
+                timestep[:, None],
+            )
+        suffix_embs, suffix_pad_masks, suffix_att_masks, adarms_cond = self.embed_suffix(x_t, model_time)
+
+        # The cached expert-only transformers path cannot invoke the fast adapters because
+        # they are inserted inside the joint PaliGemma/action-expert layer loop.  When fast
+        # conditioning is active, reuse the already embedded prefix but run that joint loop;
+        # otherwise inference would silently ignore every fast token.
+        if prefix_embs is not None and fast_tokens is not None and fast_delays is not None:
+            if (
+                self.paligemma_with_expert.paligemma.model.language_model.layers[
+                    0
+                ].self_attn.q_proj.weight.dtype
+                == torch.bfloat16
+            ):
+                prefix_embs = prefix_embs.to(dtype=torch.bfloat16)
+                suffix_embs = suffix_embs.to(dtype=torch.bfloat16)
+            prefix_att_masks = torch.zeros_like(prefix_pad_masks, dtype=torch.bool)
+            pad_masks = torch.cat([prefix_pad_masks, suffix_pad_masks], dim=1)
+            att_masks = torch.cat([prefix_att_masks, suffix_att_masks], dim=1)
+            att_2d_masks = make_att_2d_masks(pad_masks, att_masks)
+            horizon = suffix_pad_masks.shape[1]
+            action_block = att_2d_masks[:, -horizon:, -horizon:]
+            action_block &= _mask_committed_queries_from_free_actions(action_block, fast_delays)
+            position_ids = torch.cumsum(pad_masks, dim=1) - 1
+            outputs_embeds, _ = self.paligemma_with_expert.forward(
+                attention_mask=prepare_attention_masks_4d(att_2d_masks),
+                position_ids=position_ids,
+                past_key_values=None,
+                inputs_embeds=[prefix_embs, suffix_embs],
+                use_cache=False,
+                adarms_cond=[None, adarms_cond],
+                fast_adapters=fast_adapters,
+                fast_tokens=fast_tokens,
+                fast_delays=fast_delays,
+                fast_flow_times=timestep,
+                fast_observation_ages=fast_observation_ages,
+            )
+            suffix_out = outputs_embeds[1][:, -self.config.chunk_size :].to(dtype=torch.float32)
+            return self.action_out_proj(suffix_out)
 
         suffix_len = suffix_pad_masks.shape[1]
         batch_size = prefix_pad_masks.shape[0]
@@ -963,6 +1029,8 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
 
         prefix_pad_2d_masks = prefix_pad_masks[:, None, :].expand(batch_size, suffix_len, prefix_len)
         suffix_att_2d_masks = make_att_2d_masks(suffix_pad_masks, suffix_att_masks)
+        if fast_tokens is not None and fast_delays is not None:
+            suffix_att_2d_masks &= _mask_committed_queries_from_free_actions(suffix_att_2d_masks, fast_delays)
         full_att_2d_masks = torch.cat([prefix_pad_2d_masks, suffix_att_2d_masks], dim=2)
 
         prefix_offsets = torch.sum(prefix_pad_masks, dim=-1)[:, None]
@@ -1099,12 +1167,18 @@ class PI05Policy(PreTrainedPolicy):
             # First, fix any key differences (see openpi model.py, _fix_pytorch_state_dict_keys)
             fixed_state_dict = model._fix_pytorch_state_dict_keys(original_state_dict, model.config)
 
-            # Then add "model." prefix for all keys that don't already have it
+            # Legacy PI0.5 checkpoints store the inner model without the policy-level
+            # ``model.`` prefix. Framework checkpoints, however, may also contain
+            # policy-level modules whose exact keys must be preserved (for example an
+            # online-filtering encoder or posterior updater).
             remapped_state_dict = {}
             remap_count = 0
+            current_keys = set(model.state_dict())
 
             for key, value in fixed_state_dict.items():
-                if not key.startswith("model."):
+                if key in current_keys:
+                    remapped_state_dict[key] = value
+                elif not key.startswith("model.") and f"model.{key}" in current_keys:
                     new_key = f"model.{key}"
                     remapped_state_dict[new_key] = value
                     remap_count += 1
