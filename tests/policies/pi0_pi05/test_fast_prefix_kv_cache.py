@@ -6,7 +6,6 @@ from lerobot.policies.common.vla_utils import make_att_2d_masks, prepare_attenti
 from lerobot.policies.pi05.modeling_pi05 import (
     compute_layer_complete,
     forward_cached_expert_with_fast_adapters,
-    prepare_joint_semantics_prefix_cache,
 )
 from lerobot.policies.pi05.online_filtering import FastObservationAdapter
 from lerobot.policies.pi_gemma import PiGemmaModel, layernorm_forward
@@ -58,12 +57,12 @@ def test_fast_adapter_cached_prefix_matches_joint_loop() -> None:
             )
         expected, _ = layernorm_forward(expert_model.norm, joint[1], None)
 
-        cache = prepare_joint_semantics_prefix_cache(
-            prefix_model,
-            prefix,
+        cache = prefix_model(
+            inputs_embeds=prefix,
             attention_mask=attention[:, :, :5, :5],
             position_ids=position_ids[:, :5],
-        )
+            use_cache=True,
+        ).past_key_values
         actual = forward_cached_expert_with_fast_adapters(
             expert_model,
             suffix,

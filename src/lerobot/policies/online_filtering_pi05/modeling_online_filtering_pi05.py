@@ -1293,13 +1293,8 @@ class OnlineFilteringPI05Policy(PI05Policy):
         images, img_masks = self._preprocess_images(batch)
         tokens = batch[OBS_LANGUAGE_TOKENS]
         masks = batch[OBS_LANGUAGE_ATTENTION_MASK]
-        prefix_cache_kwargs = (
-            {"fast_adapter_compatible": True}
-            if getattr(self.config, "use_fast_prefix_kv_cache", False)
-            else {}
-        )
         prefix_embs, prefix_pad_masks, past_key_values = self.model.prepare_prefix_cache(
-            images, img_masks, tokens, masks, **prefix_cache_kwargs
+            images, img_masks, tokens, masks
         )
         use_updater = self.config.training_stage == "stage_b"
         use_online_flow = self.config.training_stage == "online_flow"

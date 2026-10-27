@@ -27,10 +27,23 @@ from lerobot.policies import make_policy, make_pre_post_processors
 from lerobot.policies.online_filtering_pi05.modeling_online_filtering_pi05 import (
     OnlineFilteringPI05Policy,
 )
+from lerobot.policies.online_filtering_xvla.modeling_online_filtering_xvla import (
+    OnlineFilteringXVLAPolicy,
+)
 from lerobot.processor.normalize_processor import NormalizerProcessorStep
 from lerobot.utils.constants import ACTION, OBS_LANGUAGE_ATTENTION_MASK, OBS_LANGUAGE_TOKENS
 from lerobot.utils.io_utils import write_video
 from lerobot.utils.random_utils import set_seed
+
+ONLINE_POLICY_TYPES = (OnlineFilteringPI05Policy, OnlineFilteringXVLAPolicy)
+
+
+def online_denoising_steps(policy) -> int:
+    """Return the flow-query count across PI0.5 and X-VLA naming conventions."""
+    steps = getattr(policy.config, "num_inference_steps", None)
+    if steps is None:
+        steps = policy.config.num_denoising_steps
+    return int(steps)
 
 
 def normalize_executed_command(normalizer, sent: torch.Tensor) -> torch.Tensor:
@@ -276,6 +289,9 @@ def run_episode(
         if isinstance(policy, OnlineFilteringPI05Policy):
             sent = transition[ACTION].to(device=policy.config.device)
             last_sent_model_action = normalize_executed_command(action_normalizer, sent)
+        elif isinstance(policy, OnlineFilteringXVLAPolicy):
+            index = min(active_chunk_executed, active_model_chunk.shape[1] - 1)
+            last_sent_model_action = active_model_chunk[:, index].to(policy.config.device)
         return env.step(transition[ACTION].cpu().numpy())
 
     def pop_action_or_safe_hold(action_queue):
@@ -309,7 +325,7 @@ def run_episode(
         return chunk[..., :action_dim]
 
     def predict_regular(batch):
-        if isinstance(policy, OnlineFilteringPI05Policy):
+        if isinstance(policy, ONLINE_POLICY_TYPES):
             return policy.predict_action_chunk(
                 batch, observation_age_override=args.observation_age_seconds
             )
@@ -416,7 +432,7 @@ def run_episode(
                     raw, reward, terminated, truncated, info = step_env(
                         pop_action_or_safe_hold(queue)
                     )
-                    if isinstance(policy, OnlineFilteringPI05Policy):
+                    if isinstance(policy, ONLINE_POLICY_TYPES):
                         executed_model_actions.append(last_sent_model_action.clone())
                     steps += 1
                     pending_elapsed += 1
@@ -490,6 +506,7 @@ def run_episode(
                 observation_step=observation_step,
                 old_chunk_offset=active_chunk_executed,
                 queued_count=len(queue),
+                chunk_assimilations=chunk_assimilations,
             ):
                 chunk_assimilations.append((flow_step, capture_step))
                 events.append(
@@ -512,7 +529,7 @@ def run_episode(
                 torch.cuda.synchronize()
             start = time.perf_counter()
             with torch.inference_mode():
-                if isinstance(policy, OnlineFilteringPI05Policy) and not args.disable_online_fast:
+                if isinstance(policy, ONLINE_POLICY_TYPES) and not args.disable_online_fast:
                     chunk = policy.predict_action_chunk(
                         initial,
                         observation_callback=observation_callback,
@@ -537,10 +554,11 @@ def run_episode(
             inference_seconds.append(max(0.0, pipeline_elapsed - callback_seconds + encoding_seconds))
             if episode_finished:
                 break
-            if isinstance(policy, OnlineFilteringPI05Policy) and not args.disable_online_fast:
+            if isinstance(policy, ONLINE_POLICY_TYPES) and not args.disable_online_fast:
                 expected_capture_steps = []
-                for flow_step in range(policy.config.num_inference_steps):
-                    capture_step = flow_step * delay // (policy.config.num_inference_steps - 1)
+                denoising_steps = online_denoising_steps(policy)
+                for flow_step in range(denoising_steps):
+                    capture_step = flow_step * delay // (denoising_steps - 1)
                     if capture_step > 0 and (
                         not expected_capture_steps or capture_step != expected_capture_steps[-1]
                     ):
@@ -565,8 +583,8 @@ def run_episode(
                         e["type"] == "online_assimilation" and e["step"] >= observation_step for e in events
                     ),
                     "inference_switch_step": switch_step
-                    if isinstance(policy, OnlineFilteringPI05Policy)
-                    and policy.config.training_stage == "stage_b"
+                    if isinstance(policy, ONLINE_POLICY_TYPES)
+                    and policy.config.training_stage in {"stage_b", "online_flow"}
                     and delay > 0
                     else None,
                 }
@@ -684,17 +702,21 @@ def main() -> None:
             if (dino_path / "config.json").is_file():
                 policy_cfg.dinov3_model_id = str(dino_path)
                 break
-    if hasattr(policy_cfg, "num_inference_steps") and args.switch_step_max is None:
-        args.switch_step_max = policy_cfg.num_inference_steps - 1
+    configured_steps = getattr(
+        policy_cfg, "num_inference_steps", getattr(policy_cfg, "num_denoising_steps", None)
+    )
+    if configured_steps is not None and args.switch_step_max is None:
+        args.switch_step_max = configured_steps - 1
     if hasattr(policy_cfg, "max_inference_delay") and delay_max > policy_cfg.max_inference_delay:
         raise ValueError("delay-max exceeds the checkpoint training delay range")
-    if hasattr(policy_cfg, "num_inference_steps") and policy_cfg.num_inference_steps < 2:
+    if configured_steps is not None and configured_steps < 2:
         raise ValueError("continuous evaluation requires at least two denoising steps")
     if args.replan_interval + delay_max > policy_cfg.chunk_size and not args.allow_queue_underrun:
         raise ValueError("old chunk cannot cover replan-interval + delay-max")
     switch_rng = random.Random(args.seed + 1 if args.switch_seed is None else args.switch_seed)
-    control_mode = args.control_mode or ("absolute" if policy_cfg.type == "xvla" else "relative")
-    episode_length = args.episode_length or (800 if policy_cfg.type == "xvla" else None)
+    xvla_policy = policy_cfg.type in {"xvla", "online_filtering_xvla"}
+    control_mode = args.control_mode or ("absolute" if xvla_policy else "relative")
+    episode_length = args.episode_length or (800 if xvla_policy else None)
     # Build the policy once. All LIBERO suites use the same feature contract.
     policy_env_cfg = LiberoEnv(
         task=suites[0],
@@ -711,6 +733,8 @@ def main() -> None:
             "continuous two-condition evaluation requires training_stage='online_flow'; "
             f"checkpoint has {policy.config.training_stage!r}"
         )
+    if isinstance(policy, OnlineFilteringXVLAPolicy) and policy.config.training_stage != "stage_b":
+        raise ValueError("continuous X-VLA evaluation requires training_stage='stage_b'")
     preprocessor_overrides = {"device_processor": {"device": args.device}}
     if isinstance(policy, OnlineFilteringPI05Policy):
         preprocessor_overrides["tokenizer_processor"] = {
@@ -723,7 +747,7 @@ def main() -> None:
         preprocessor_overrides["tokenizer_processor"] = {
             "tokenizer_name": "/data/yhr/pretrain/recovered_zhoukai/pretrain/paligemma-tokenizer"
         }
-    elif policy_cfg.type == "xvla":
+    elif policy_cfg.type in {"xvla", "online_filtering_xvla"}:
         bart_tokenizer = baseline_root / "bart-large-tokenizer"
         if (bart_tokenizer / "tokenizer.json").is_file():
             preprocessor_overrides["tokenizer_processor"] = {
@@ -823,8 +847,8 @@ def main() -> None:
                         "policy_path": str(policy_path),
                         "policy_type": policy_cfg.type,
                         "posterior_bridge": (
-                            isinstance(policy, OnlineFilteringPI05Policy)
-                            and policy.config.training_stage == "stage_b"
+                            isinstance(policy, ONLINE_POLICY_TYPES)
+                            and policy.config.training_stage in {"stage_b", "online_flow"}
                         ),
                         "suite": suite,
                         "task_id": task_id,
@@ -856,7 +880,8 @@ def main() -> None:
         aggregate = {
             "policy_path": str(policy_path),
             "posterior_bridge": (
-                isinstance(policy, OnlineFilteringPI05Policy) and policy.config.training_stage == "stage_b"
+                isinstance(policy, ONLINE_POLICY_TYPES)
+                and policy.config.training_stage in {"stage_b", "online_flow"}
             ),
             "episodes_per_task": args.episodes,
             "evaluation_protocol": "continuous_online_v1",

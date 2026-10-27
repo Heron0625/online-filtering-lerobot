@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import copy
 from collections import deque
+from dataclasses import dataclass
 
 import torch
 from torch import Tensor, nn
@@ -48,8 +49,24 @@ class OnlineFilteringXVLAModel(XVLAModel):
         new_delay: Tensor,
         flow_time: Tensor,
     ) -> dict[str, Tensor]:
-        old = self.forward_vlm(input_ids, old_images, old_image_mask)
-        new = self.forward_vlm(input_ids, new_images, new_image_mask)
+        old = self.encode_condition(input_ids, old_images, old_image_mask)
+        new = self.encode_condition(input_ids, new_images, new_image_mask)
+        return self.fuse_conditions(old, new, old_delay, new_delay, flow_time)
+
+    def encode_condition(
+        self, input_ids: Tensor, images: Tensor, image_mask: Tensor
+    ) -> dict[str, Tensor]:
+        """Encode one observation once; inference reuses this across denoising queries."""
+        return self.forward_vlm(input_ids, images.to(self._get_target_dtype()), image_mask)
+
+    def fuse_conditions(
+        self,
+        old: dict[str, Tensor],
+        new: dict[str, Tensor],
+        old_delay: Tensor,
+        new_delay: Tensor,
+        flow_time: Tensor,
+    ) -> dict[str, Tensor]:
         scale = float(max(1, self.config.max_inference_delay))
         gate = self.condition_gate(old_delay / scale, new_delay / scale, flow_time)
         return {
@@ -96,6 +113,56 @@ class OnlineFilteringXVLAModel(XVLAModel):
             **enc,
         )
 
+    def predict_endpoint_from_encoded(
+        self,
+        *,
+        old_condition: dict[str, Tensor],
+        new_condition: dict[str, Tensor],
+        domain_id: Tensor,
+        old_proprio: Tensor,
+        new_proprio: Tensor,
+        old_delay: Tensor,
+        new_delay: Tensor,
+        particle: Tensor,
+        flow_time: Tensor,
+    ) -> Tensor:
+        """Predict an endpoint without rerunning Florence for cached observations."""
+        dtype = self._get_target_dtype()
+        enc = self.fuse_conditions(
+            old_condition,
+            new_condition,
+            old_delay.to(dtype),
+            new_delay.to(dtype),
+            flow_time.to(dtype),
+        )
+        scale = float(max(1, self.config.max_inference_delay))
+        proprio_gate = self.proprio_gate(
+            old_delay.to(dtype) / scale,
+            new_delay.to(dtype) / scale,
+            flow_time.to(dtype),
+        )
+        proprio = old_proprio.to(dtype) + proprio_gate * (
+            new_proprio.to(dtype) - old_proprio.to(dtype)
+        )
+        proprio_m, particle_m = self.action_space.preprocess(proprio, particle.to(dtype))
+        return self.transformer(
+            domain_id=domain_id,
+            action_with_noise=particle_m,
+            t=flow_time.to(dtype),
+            proprio=proprio_m,
+            **enc,
+        )
+
+
+@dataclass
+class XVLAObservationPacket:
+    condition: dict[str, Tensor]
+    proprio: Tensor
+    domain_id: Tensor
+    capture_step: int
+    generation: int
+    executed_prefix: Tensor
+
 
 class OnlineFilteringXVLAPolicy(XVLAPolicy):
     config_class = OnlineFilteringXVLAConfig
@@ -110,6 +177,8 @@ class OnlineFilteringXVLAPolicy(XVLAPolicy):
         self.model = OnlineFilteringXVLAModel(config, florence_config, proprio_dim)
         self._queues = {ACTION: deque(maxlen=config.n_action_steps)}
         object.__setattr__(self, "_online_flow_teacher", None)
+        self._online_generation = 0
+        self._pending_online_packet: XVLAObservationPacket | None = None
 
     def initialize_online_flow_teacher(self) -> None:
         if self.config.training_stage != "stage_b" or self._online_flow_teacher is not None:
@@ -135,6 +204,16 @@ class OnlineFilteringXVLAPolicy(XVLAPolicy):
         if self._online_flow_teacher is not None:
             self._online_flow_teacher.eval()
         return self
+
+    def reset(self) -> None:
+        super().reset()
+        self._online_generation = getattr(self, "_online_generation", 0) + 1
+        self._pending_online_packet = None
+
+    def begin_online_generation(self) -> int:
+        self._online_generation += 1
+        self._pending_online_packet = None
+        return self._online_generation
 
     def _prepare_images_at(self, batch: dict[str, Tensor], indices: Tensor) -> tuple[Tensor, Tensor]:
         images, masks = [], []
@@ -188,6 +267,56 @@ class OnlineFilteringXVLAPolicy(XVLAPolicy):
             "old_delay": old_delay,
             "new_delay": new_delay,
         }
+
+    @torch.no_grad()
+    def _encode_runtime_condition(self, batch: dict[str, Tensor]) -> tuple[dict[str, Tensor], Tensor, Tensor]:
+        input_ids = batch[OBS_LANGUAGE_TOKENS]
+        batch_size = input_ids.shape[0]
+        zero = torch.zeros(batch_size, dtype=torch.long, device=input_ids.device)
+        images, image_mask = self._prepare_images_at(batch, zero)
+        condition = self.model.encode_condition(input_ids, images, image_mask)
+        proprio = self._prepare_state_at(batch, zero)
+        domain_id = self._get_domain_id(batch, batch_size, images.device)
+        return condition, proprio, domain_id
+
+    @torch.no_grad()
+    def encode_fast_observation_packet(
+        self,
+        batch: dict[str, Tensor],
+        *,
+        capture_step: int,
+        generation: int,
+        executed_prefix: Tensor,
+        **kwargs,
+    ) -> XVLAObservationPacket:
+        """Encode a new online observation once, outside the denoising query loop."""
+        if kwargs.keys() - {"initial_batch", "capture_timestamp"}:
+            raise TypeError(f"unsupported packet arguments: {sorted(kwargs)}")
+        if not 0 <= capture_step <= self.config.max_inference_delay:
+            raise ValueError("capture_step exceeds the trained delay range")
+        condition, proprio, domain_id = self._encode_runtime_condition(batch)
+        return XVLAObservationPacket(
+            condition={key: value.detach() for key, value in condition.items()},
+            proprio=proprio.detach(),
+            domain_id=domain_id.detach(),
+            capture_step=capture_step,
+            generation=generation,
+            executed_prefix=executed_prefix.detach(),
+        )
+
+    def push_fast_observation(self, packet: XVLAObservationPacket) -> None:
+        if packet.generation != self._online_generation:
+            return
+        current = self._pending_online_packet
+        if current is None or packet.capture_step >= current.capture_step:
+            self._pending_online_packet = packet
+
+    def _take_online_packet(self, after_delay: int, generation: int) -> XVLAObservationPacket | None:
+        packet = self._pending_online_packet
+        if packet is None or packet.generation != generation or packet.capture_step <= after_delay:
+            return None
+        self._pending_online_packet = None
+        return packet
 
     def _stage_a_forward(self, batch: dict[str, Tensor]) -> tuple[Tensor, dict]:
         targets = self._prepare_action_targets(batch)
@@ -277,5 +406,88 @@ class OnlineFilteringXVLAPolicy(XVLAPolicy):
             flow_time = torch.full((batch_size,), step / self.config.num_denoising_steps, device=device, dtype=noise.dtype)
             particle = noise * flow_time[:, None, None] + endpoint * (1 - flow_time[:, None, None])
             endpoint = self.model.predict_endpoint(**condition, particle=particle, flow_time=flow_time)
+        return self.model.action_space.postprocess(endpoint)
+
+    @torch.no_grad()
+    def predict_action_chunk(self, batch: dict[str, Tensor], **kwargs) -> Tensor:
+        """Generate one chunk while causally assimilating encoded observation packets."""
+        observation_callback = kwargs.pop("observation_callback", None)
+        if observation_callback is None:
+            if kwargs:
+                raise TypeError(f"unsupported inference arguments: {sorted(kwargs)}")
+            return self._get_action_chunk(batch)
+        if batch[OBS_LANGUAGE_TOKENS].shape[0] != 1:
+            raise ValueError("online X-VLA inference currently requires batch size one")
+
+        generation = kwargs.pop("online_generation", None)
+        if generation is None:
+            generation = self.begin_online_generation()
+        assimilation_callback = kwargs.pop("assimilation_callback", None)
+        kwargs.pop("observation_age_override", None)  # X-VLA currently conditions on step delay.
+        num_steps = int(kwargs.pop("num_steps", self.config.num_denoising_steps))
+        noise = kwargs.pop("noise", None)
+        if kwargs:
+            raise TypeError(f"unsupported online inference arguments: {sorted(kwargs)}")
+        if num_steps < 2:
+            raise ValueError("continuous online inference requires at least two denoising steps")
+
+        current_condition, current_proprio, domain_id = self._encode_runtime_condition(batch)
+        input_ids = batch[OBS_LANGUAGE_TOKENS]
+        device = input_ids.device
+        dtype = self.model._get_target_dtype()
+        if noise is None:
+            noise = torch.randn(
+                1,
+                self.config.chunk_size,
+                self.model.dim_action,
+                device=device,
+                dtype=dtype,
+            )
+        endpoint = torch.zeros_like(noise)
+        current_delay = 0
+        committed_actions: Tensor | None = None
+
+        for query in range(num_steps):
+            flow_time = torch.full((1,), 1 - query / num_steps, device=device, dtype=dtype)
+            particle = noise * flow_time[:, None, None] + endpoint * (1 - flow_time[:, None, None])
+            observation_callback(query, num_steps, generation)
+            packet = self._take_online_packet(current_delay, generation)
+            old_condition = current_condition
+            old_proprio = current_proprio
+            old_delay = current_delay
+            if packet is not None:
+                current_condition = packet.condition
+                current_proprio = packet.proprio
+                domain_id = packet.domain_id
+                current_delay = packet.capture_step
+                committed_actions = torch.zeros_like(particle)
+                prefix = packet.executed_prefix.to(committed_actions)
+                committed_actions[:, :current_delay, : prefix.shape[-1]] = prefix[:, :current_delay]
+                if assimilation_callback is not None:
+                    assimilation_callback(
+                        query,
+                        current_delay,
+                        self.config.training_stage == "stage_b",
+                    )
+            if committed_actions is not None:
+                positions = torch.arange(self.config.chunk_size, device=device)[None]
+                particle = torch.where(
+                    (positions < current_delay)[..., None], committed_actions, particle
+                )
+            endpoint = self.model.predict_endpoint_from_encoded(
+                old_condition=old_condition,
+                new_condition=current_condition,
+                domain_id=domain_id,
+                old_proprio=old_proprio,
+                new_proprio=current_proprio,
+                old_delay=torch.tensor([old_delay], device=device),
+                new_delay=torch.tensor([current_delay], device=device),
+                particle=particle,
+                flow_time=flow_time,
+            )
+            if committed_actions is not None:
+                endpoint = torch.where(
+                    (positions < current_delay)[..., None], committed_actions, endpoint
+                )
         return self.model.action_space.postprocess(endpoint)
 
