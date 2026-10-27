@@ -22,7 +22,14 @@ CUDA_VISIBLE_DEVICES="$GPUS" accelerate launch --multi_gpu --num_processes="$PRO
   --dataset.video_backend=pyav \
   --policy.path="$SOURCE" \
   --policy.training_stage=stage_a \
-  --policy.max_inference_delay=10 \
+  --policy.max_inference_delay=25 \
+  --policy.dinov3_model_id=/data/yhr/pretrain/dinov3-vits16-pretrain-lvd1689m \
+  --policy.freeze_dinov3=true \
+  --policy.fast_num_tokens=64 \
+  --policy.slow_visual_dropout_probability=0.0 \
+  --policy.slow_visual_dropout_final_probability=0.25 \
+  --policy.slow_visual_dropout_anneal_start_step=500 \
+  --policy.slow_visual_dropout_anneal_steps=2000 \
   --policy.freeze_vision_encoder=false \
   --policy.freeze_language_encoder=false \
   --policy.dtype=bfloat16 \

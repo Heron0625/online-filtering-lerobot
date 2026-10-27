@@ -217,7 +217,7 @@ def test_affine_flow_euler_integration_matches_closed_form():
     assert fine_error < 1e-12
 
 
-def test_fast_resampler_shapes_and_zero_visual_residual():
+def test_fast_resampler_shapes_without_observation_difference_features():
     module = FastTokenResampler(
         feature_dim=12,
         output_dim=32,
@@ -226,12 +226,10 @@ def test_fast_resampler_shapes_and_zero_visual_residual():
         num_cameras=2,
         state_dim=5,
     )
-    initial = torch.randn(2, 2, 6, 12)
-    current = initial.clone()
-    output = module(initial, current, delays=torch.tensor([0, 3]), states=torch.randn(2, 5))
+    current = torch.randn(2, 2, 6, 12)
+    output = module(current, delays=torch.tensor([0, 3]), states=torch.randn(2, 5))
     assert output.shape == (2, 8, 32)
-    concatenated = torch.cat([current, initial, current - initial], dim=-1)
-    assert torch.count_nonzero(concatenated[..., -12:]) == 0
+    assert module.feature_proj.in_features == 12
 
 
 def test_dinov3_patch_encoder_strips_cls_and_register_tokens():
@@ -247,16 +245,13 @@ def test_dinov3_patch_encoder_strips_cls_and_register_tokens():
 def test_fast_resampler_honors_patch_mask():
     torch.manual_seed(0)
     module = FastTokenResampler(4, 16, num_fast_tokens=4, num_heads=4, num_cameras=2)
-    initial = torch.randn(1, 2, 3, 4)
     current = torch.randn(1, 2, 3, 4)
     mask = torch.tensor([[[True, True, False], [True, False, False]]])
-    baseline = module(initial, current, delays=torch.tensor([1]), patch_mask=mask)
+    baseline = module(current, delays=torch.tensor([1]), patch_mask=mask)
 
-    modified_initial = initial.clone()
     modified_current = current.clone()
-    modified_initial[~mask] = 10_000
     modified_current[~mask] = -10_000
-    modified = module(modified_initial, modified_current, delays=torch.tensor([1]), patch_mask=mask)
+    modified = module(modified_current, delays=torch.tensor([1]), patch_mask=mask)
     assert torch.allclose(baseline, modified, atol=1e-5, rtol=1e-5)
 
 
@@ -384,7 +379,7 @@ def test_zero_initialized_fast_adapter_is_identity():
     adapter = FastObservationAdapter(hidden_dim=32, num_heads=4)
     actions = torch.randn(2, 10, 32)
     fast = torch.randn(2, 8, 32)
-    output = adapter(actions, fast, delays=torch.tensor([3, 5]), flow_times=torch.tensor([0.2, 0.8]))
+    output = adapter(actions, fast, delays=torch.tensor([3, 5]))
     assert torch.equal(output, actions)
 
 
@@ -393,7 +388,7 @@ def test_fast_adapter_updates_only_actions_after_observation():
     adapter = FastObservationAdapter(hidden_dim=16, num_heads=4)
     torch.nn.init.normal_(adapter.output_proj.weight)
     actions = torch.randn(1, 8, 16)
-    output = adapter(actions, torch.randn(1, 4, 16), delays=torch.tensor([3]), flow_times=torch.tensor([0.5]))
+    output = adapter(actions, torch.randn(1, 4, 16), delays=torch.tensor([3]))
     assert torch.equal(output[:, :3], actions[:, :3])
     assert not torch.equal(output[:, 3:], actions[:, 3:])
 

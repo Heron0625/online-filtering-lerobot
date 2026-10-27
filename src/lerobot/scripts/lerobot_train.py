@@ -97,6 +97,7 @@ else:
 from .lerobot_eval import eval_policy_all
 
 EMA_STATE_FILENAME = "ema_state.pt"
+ONLINE_FLOW_TEACHER_STATE_FILENAME = "online_flow_teacher_state.pt"
 
 
 @contextmanager
@@ -630,6 +631,14 @@ def train(cfg: TrainPipelineConfig):
     unwrapped_policy = accelerator.unwrap_model(policy)
     if hasattr(unwrapped_policy, "initialize_online_flow_teacher"):
         unwrapped_policy.initialize_online_flow_teacher()
+        if cfg.checkpoint_path is not None and hasattr(
+            unwrapped_policy, "load_online_flow_teacher_state_dict"
+        ):
+            teacher_path = cfg.checkpoint_path / TRAINING_STATE_DIR / ONLINE_FLOW_TEACHER_STATE_FILENAME
+            if teacher_path.exists():
+                teacher_state = torch.load(teacher_path, map_location=device, weights_only=True)
+                unwrapped_policy.load_online_flow_teacher_state_dict(teacher_state)
+                logging.info("Resumed online-flow EMA teacher from %s", teacher_path)
 
     # EMA shadow of the policy weights (Chi et al. 2023, Diffusion Policy, section V.D). The shadow
     # lives on the main process only, which is safe under DDP where every rank holds identical
@@ -841,11 +850,18 @@ def train(cfg: TrainPipelineConfig):
                 accelerator=accelerator,
             )
             if is_main_process():
+                unwrapped_policy = accelerator.unwrap_model(policy)
+                if hasattr(unwrapped_policy, "online_flow_teacher_state_dict"):
+                    teacher_state = unwrapped_policy.online_flow_teacher_state_dict()
+                    if teacher_state is not None:
+                        torch.save(
+                            teacher_state,
+                            checkpoint_dir / TRAINING_STATE_DIR / ONLINE_FLOW_TEACHER_STATE_FILENAME,
+                        )
                 if ema is not None:
                     # Save the shadow for exact resume, plus a directly loadable copy of the EMA
                     # weights (lerobot-eval --policy.path=<checkpoint>/pretrained_model_ema).
                     torch.save(ema.state_dict(), checkpoint_dir / TRAINING_STATE_DIR / EMA_STATE_FILENAME)
-                    unwrapped_policy = accelerator.unwrap_model(policy)
                     ema_dir = checkpoint_dir / f"{PRETRAINED_MODEL_DIR}_ema"
                     with _ema_weights(ema, unwrapped_policy):
                         unwrapped_policy.save_pretrained(ema_dir)

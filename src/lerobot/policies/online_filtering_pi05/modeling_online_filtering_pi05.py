@@ -41,12 +41,15 @@ def sample_online_flow_transitions(
     valid_observations: Tensor,
     num_inference_steps: int,
     generator: torch.Generator | None = None,
+    main_delay_probability: float = 0.5,
+    medium_delay_probability: float = 0.25,
 ) -> tuple[Tensor, Tensor, Tensor, Tensor]:
     """Sample one transition from the continuous-online LIBERO control/flow clock.
 
-    A per-sample total delay is uniform over its valid positive observation indices. Query
-    k observes floor(k * total_delay / (N - 1)) control steps, exactly matching the
-    continuous_online_v1 evaluator. Repeated indices naturally produce identity transitions.
+    Query k observes floor(k * total_delay / (N - 1)) control steps, exactly matching the
+    continuous_online_v1 evaluator. Total delay uses the deployment-prior mixture over
+    1--10, 11--20, and 21+ control steps. Repeated indices naturally produce identity
+    transitions.
     """
     valid = valid_observations.bool()
     if valid.ndim != 2 or valid.shape[1] < 1 or not torch.all(valid[:, 0]):
@@ -56,17 +59,16 @@ def sample_online_flow_transitions(
 
     device = valid.device
     batch_size = valid.shape[0]
-    total_delays = torch.zeros(batch_size, dtype=torch.long, device=device)
-    query_steps = torch.randint(
-        num_inference_steps, (batch_size,), device=device, generator=generator
+    total_delays = sample_online_total_delays(
+        valid,
+        generator=generator,
+        main_delay_probability=main_delay_probability,
+        medium_delay_probability=medium_delay_probability,
     )
+    query_steps = torch.randint(num_inference_steps, (batch_size,), device=device, generator=generator)
     for row in range(batch_size):
-        positive = torch.nonzero(valid[row, 1:], as_tuple=False).flatten() + 1
-        if positive.numel() == 0:
+        if total_delays[row] == 0:
             query_steps[row] = 0
-            continue
-        choice = torch.randint(positive.numel(), (), device=device, generator=generator)
-        total_delays[row] = positive[choice]
 
     new_delays = query_steps * total_delays // (num_inference_steps - 1)
     previous_steps = (query_steps - 1).clamp_min(0)
@@ -76,6 +78,38 @@ def sample_online_flow_transitions(
     if not torch.all(valid[rows, old_delays] & valid[rows, new_delays]):
         raise ValueError("online delay clock selected a padded observation")
     return old_delays, new_delays, flow_times, total_delays
+
+
+def sample_online_total_delays(
+    valid_observations: Tensor,
+    generator: torch.Generator | None = None,
+    main_delay_probability: float = 0.5,
+    medium_delay_probability: float = 0.25,
+) -> Tensor:
+    """Sample valid total delays from the shared short/medium/long deployment prior."""
+    if not 0 <= main_delay_probability <= 1:
+        raise ValueError("main_delay_probability must be in [0, 1]")
+    if not 0 <= medium_delay_probability <= 1 - main_delay_probability:
+        raise ValueError("delay mixture probabilities are invalid")
+    valid = valid_observations.bool()
+    if valid.ndim != 2 or valid.shape[1] < 1 or not torch.all(valid[:, 0]):
+        raise ValueError("valid_observations must have shape (batch, window) and valid delay zero")
+    totals = torch.zeros(valid.shape[0], dtype=torch.long, device=valid.device)
+    draws = torch.rand(valid.shape[0], device=valid.device, generator=generator)
+    for row in range(valid.shape[0]):
+        positive = torch.nonzero(valid[row, 1:], as_tuple=False).flatten() + 1
+        if not positive.numel():
+            continue
+        if draws[row] < main_delay_probability:
+            candidates = positive[positive <= 10]
+        elif draws[row] < main_delay_probability + medium_delay_probability:
+            candidates = positive[(positive >= 11) & (positive <= 20)]
+        else:
+            candidates = positive[positive >= 21]
+        candidates = candidates if candidates.numel() else positive
+        choice = torch.randint(candidates.numel(), (), device=valid.device, generator=generator)
+        totals[row] = candidates[choice]
+    return totals
 
 
 def sample_stage_a_delays_and_branches(
@@ -438,12 +472,29 @@ class OnlineFilteringPI05Policy(PI05Policy):
         if teacher is None:
             return
         decay = self.config.online_flow_ema_decay
-        for teacher_parameter, student_parameter in zip(
-            teacher.parameters(), self.parameters(), strict=True
-        ):
+        for teacher_parameter, student_parameter in zip(teacher.parameters(), self.parameters(), strict=True):
             teacher_parameter.lerp_(student_parameter.detach(), 1 - decay)
         for teacher_buffer, student_buffer in zip(teacher.buffers(), self.buffers(), strict=True):
             teacher_buffer.copy_(student_buffer.detach())
+
+    def online_flow_teacher_state_dict(self) -> dict[str, Tensor] | None:
+        """Return the trainable EMA subset needed for exact Phase-2 resume."""
+        teacher = self._online_flow_teacher
+        if teacher is None:
+            return None
+        trainable = {name for name, parameter in self.named_parameters() if parameter.requires_grad}
+        return {
+            name: value.detach().cpu() for name, value in teacher.state_dict().items() if name in trainable
+        }
+
+    def load_online_flow_teacher_state_dict(self, state: dict[str, Tensor]) -> None:
+        teacher = self._online_flow_teacher
+        if teacher is None:
+            raise RuntimeError("online-flow teacher must be initialized before loading its state")
+        incompatible = teacher.load_state_dict(state, strict=False)
+        unexpected = [name for name in incompatible.unexpected_keys if name in state]
+        if unexpected:
+            raise ValueError(f"unexpected online-flow teacher keys: {unexpected}")
 
     def _freeze_stage_a_teacher(self) -> None:
         for parameter in self.parameters():
@@ -581,8 +632,7 @@ class OnlineFilteringPI05Policy(PI05Policy):
                 initial[pad_key] = batch[pad_key][:, 0]
         return initial
 
-    def _fast_pixels(self, batch: dict[str, Tensor], delays: Tensor) -> tuple[Tensor, Tensor]:
-        initial_cameras = []
+    def _fast_pixels(self, batch: dict[str, Tensor], delays: Tensor) -> Tensor:
         current_cameras = []
         mean = torch.tensor(self.config.fast_image_mean, device=delays.device).view(1, 3, 1, 1)
         std = torch.tensor(self.config.fast_image_std, device=delays.device).view(1, 3, 1, 1)
@@ -591,35 +641,26 @@ class OnlineFilteringPI05Policy(PI05Policy):
             images = raw_images.to(device=delays.device, dtype=torch.float32)
             if raw_images.dtype == torch.uint8:
                 images = images / 255.0
-            initial = images[:, 0]
             current = select_temporal_steps(images, delays)
-            if initial.shape[1] != 3:
-                initial = initial.permute(0, 3, 1, 2)
+            if current.shape[1] != 3:
                 current = current.permute(0, 3, 1, 2)
-            initial = F.interpolate(
-                initial, size=(self.config.fast_image_size, self.config.fast_image_size), mode="bilinear"
-            )
             current = F.interpolate(
                 current, size=(self.config.fast_image_size, self.config.fast_image_size), mode="bilinear"
             )
-            initial_cameras.append((initial - mean) / std)
             current_cameras.append((current - mean) / std)
-        return torch.stack(initial_cameras, dim=1), torch.stack(current_cameras, dim=1)
+        return torch.stack(current_cameras, dim=1)
 
     def _make_fast_tokens(self, batch: dict[str, Tensor], delays: Tensor) -> Tensor:
-        initial_pixels, current_pixels = self._fast_pixels(batch, delays)
-        initial_features = self.fast_encoder(initial_pixels.to(self.fast_encoder_device))
+        current_pixels = self._fast_pixels(batch, delays)
         current_features = self.fast_encoder(current_pixels.to(self.fast_encoder_device))
         resampler_dtype = self.model.fast_resampler.feature_proj.weight.dtype
         resampler_device = self.model.fast_resampler.feature_proj.weight.device
-        initial_features = initial_features.to(device=resampler_device, dtype=resampler_dtype)
         current_features = current_features.to(device=resampler_device, dtype=resampler_dtype)
         states = select_temporal_steps(batch[OBS_STATE], delays)
         states = pad_vector(states, self.config.max_state_dim).to(
-            device=initial_features.device, dtype=resampler_dtype
+            device=current_features.device, dtype=resampler_dtype
         )
         return self.model.fast_resampler(
-            initial_features,
             current_features,
             delays=delays,
             states=states,
@@ -654,45 +695,34 @@ class OnlineFilteringPI05Policy(PI05Policy):
             device=resampler_device, dtype=dtype
         )
         delays = torch.full((batch_size,), delay, dtype=torch.long, device=resampler_device)
-        return self.model.fast_resampler(features, features, delays=delays, states=states)
+        return self.model.fast_resampler(features, delays=delays, states=states)
 
     def _make_paired_fast_tokens(
         self,
-        initial_batch: dict[str, Tensor],
+        _initial_batch: dict[str, Tensor],
         current_batch: dict[str, Tensor],
         delay: int,
     ) -> Tensor:
         """Encode a deterministic initial/current observation pair for delayed evaluation."""
         if not 0 <= delay <= self.config.max_inference_delay:
             raise ValueError(f"delay must be in [0, {self.config.max_inference_delay}], got {delay}")
-        initial_cameras = []
         current_cameras = []
-        first = initial_batch[next(iter(self.config.image_features))]
+        first = current_batch[next(iter(self.config.image_features))]
         batch_size = first.shape[0]
         device = first.device
         mean = torch.tensor(self.config.fast_image_mean, device=device).view(1, 3, 1, 1)
         std = torch.tensor(self.config.fast_image_std, device=device).view(1, 3, 1, 1)
         for key in self.config.image_features:
-            initial = initial_batch[key].to(device=device, dtype=torch.float32)
             current = current_batch[key].to(device=device, dtype=torch.float32)
-            if initial_batch[key].dtype == torch.uint8:
-                initial = initial / 255.0
             if current_batch[key].dtype == torch.uint8:
                 current = current / 255.0
-            if initial.shape[1] != 3:
-                initial = initial.permute(0, 3, 1, 2)
+            if current.shape[1] != 3:
                 current = current.permute(0, 3, 1, 2)
-            initial_cameras.append(
-                (F.interpolate(initial, size=(self.config.fast_image_size,) * 2, mode="bilinear") - mean)
-                / std
-            )
             current_cameras.append(
                 (F.interpolate(current, size=(self.config.fast_image_size,) * 2, mode="bilinear") - mean)
                 / std
             )
-        initial_pixels = torch.stack(initial_cameras, dim=1)
         current_pixels = torch.stack(current_cameras, dim=1)
-        initial_features = self.fast_encoder(initial_pixels.to(self.fast_encoder_device))
         current_features = self.fast_encoder(current_pixels.to(self.fast_encoder_device))
         dtype = self.model.fast_resampler.feature_proj.weight.dtype
         resampler_device = self.model.fast_resampler.feature_proj.weight.device
@@ -701,7 +731,6 @@ class OnlineFilteringPI05Policy(PI05Policy):
         )
         delays = torch.full((batch_size,), delay, dtype=torch.long, device=resampler_device)
         return self.model.fast_resampler(
-            initial_features.to(device=resampler_device, dtype=dtype),
             current_features.to(device=resampler_device, dtype=dtype),
             delays=delays,
             states=states,
@@ -772,9 +801,7 @@ class OnlineFilteringPI05Policy(PI05Policy):
         if not self.training or probability <= 0:
             return None
         device = images[0].device
-        selected = (
-            torch.rand(batch_size, device=device) < probability
-        )
+        selected = torch.rand(batch_size, device=device) < probability
         side = (
             self.model.paligemma_with_expert.paligemma.config.vision_config.image_size
             // self.model.paligemma_with_expert.paligemma.config.vision_config.patch_size
@@ -851,13 +878,14 @@ class OnlineFilteringPI05Policy(PI05Policy):
         loss_dict["loss"] = loss.item()
         return loss, loss_dict
 
-    def _forward_online_flow_canonical(
-        self, batch: dict[str, Tensor], reduction: str
-    ) -> tuple[Tensor, dict]:
+    def _forward_online_flow_canonical(self, batch: dict[str, Tensor], reduction: str) -> tuple[Tensor, dict]:
         """Train the unified old/new-conditioned vector field on the deployment clock."""
         valid_observations = self._observation_validity(batch)
         old_delays, new_delays, time, total_delays = sample_online_flow_transitions(
-            valid_observations, self.config.num_inference_steps
+            valid_observations,
+            self.config.num_inference_steps,
+            main_delay_probability=self.config.main_delay_probability,
+            medium_delay_probability=self.config.medium_delay_probability,
         )
         initial_batch = self._initial_slow_batch(batch)
         images, img_masks = self._preprocess_images(initial_batch)
@@ -923,10 +951,15 @@ class OnlineFilteringPI05Policy(PI05Policy):
         schedule_modes = torch.zeros(valid.shape[0], dtype=torch.long, device=valid.device)
         max_step = min(self.config.online_flow_rollout_steps, num_steps - 1)
         for row in range(valid.shape[0]):
-            positive = torch.nonzero(valid[row, 1:], as_tuple=False).flatten() + 1
-            if not positive.numel():
+            total = int(
+                sample_online_total_delays(
+                    valid[row : row + 1],
+                    main_delay_probability=self.config.main_delay_probability,
+                    medium_delay_probability=self.config.medium_delay_probability,
+                )[0].item()
+            )
+            if total == 0:
                 continue
-            total = int(positive[torch.randint(positive.numel(), (), device=valid.device)].item())
             mode = 0
             schedule = torch.arange(num_steps, device=valid.device) * total // (num_steps - 1)
             schedules[row] = schedule
@@ -967,9 +1000,7 @@ class OnlineFilteringPI05Policy(PI05Policy):
                     teacher_fast_tokens[step] = teacher._make_fast_tokens(batch, new_delays)
                 old_fast = teacher_fast_tokens[old_step]
                 new_fast = teacher_fast_tokens[step]
-                condition = teacher._make_online_condition_tokens(
-                    old_fast, new_fast, old_delays, new_delays
-                )
+                condition = teacher._make_online_condition_tokens(old_fast, new_fast, old_delays, new_delays)
                 current_time = torch.full(
                     (batch_size,),
                     1.0 - step / self.config.num_inference_steps,

@@ -19,6 +19,7 @@ from lerobot.policies.online_filtering_pi05.modeling_online_filtering_pi05 impor
     sample_causal_delays,
     sample_midflow_times,
     sample_online_flow_transitions,
+    sample_online_total_delays,
     sample_stage_a_delays_and_branches,
     select_temporal_steps,
 )
@@ -170,6 +171,22 @@ def test_online_flow_transition_uses_only_valid_observations() -> None:
     assert torch.all(valid[rows, new])
     assert total[0] in (1, 2)
     assert total[1] == 0
+
+
+@pytest.mark.parametrize(
+    ("main_probability", "medium_probability", "lower", "upper"),
+    [(1.0, 0.0, 1, 10), (0.0, 1.0, 11, 20), (0.0, 0.0, 21, 25)],
+)
+def test_online_total_delay_mixture_selects_requested_band(
+    main_probability: float, medium_probability: float, lower: int, upper: int
+) -> None:
+    total = sample_online_total_delays(
+        torch.ones(64, 26, dtype=torch.bool),
+        generator=torch.Generator().manual_seed(41),
+        main_delay_probability=main_probability,
+        medium_delay_probability=medium_probability,
+    )
+    assert torch.all((total >= lower) & (total <= upper))
 
 
 def test_stage_a_clean_flow_uses_one_delay_for_prefix_and_suffix() -> None:

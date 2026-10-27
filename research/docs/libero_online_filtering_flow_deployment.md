@@ -131,11 +131,11 @@ R_d^{agent},R_d^{wrist},q_{t+d},d
 \right),
 $$
 
-将它们压缩为固定的 8--16 个 fast tokens，并投影到 PI0.5 action expert 的 hidden dimension。
+将它们压缩为固定的 64 个空间 fast visual tokens（两路相机各 32 个），再附加一个 proprio token，并投影到 PI0.5 action expert 的 hidden dimension。
 
 建议训练策略：
 
-1. 初始实现冻结完整 DINOv3，只训练 resampler、projection、gated cross-attention 和 posterior updater；
+1. 初始实现冻结完整 DINOv3，只训练 resampler、zero-init residual cross-attention 和 online flow；
 2. 基线收敛后，可解冻 DINOv3 最后 1--2 个 block，以主干学习率的 $0.01$--$0.1$ 倍微调；
 3. 保留 frozen-DINOv3 ablation，防止把收益错误归因于增加可训练视觉参数；
 4. 图像预处理采用 DINOv3 对应的 `AutoImageProcessor`，不能直接沿用 PI0.5/PaliGemma 的 normalization；

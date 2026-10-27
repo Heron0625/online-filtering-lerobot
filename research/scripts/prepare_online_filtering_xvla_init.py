@@ -27,9 +27,17 @@ def main() -> None:
     config["type"] = "online_filtering_xvla"
     config.update(
         training_stage=args.training_stage,
-        max_inference_delay=10,
+        max_inference_delay=25,
         online_flow_ema_decay=0.999,
         online_flow_rollout_steps=9,
+        dinov3_model_id="/data/yhr/pretrain/dinov3-vits16-pretrain-lvd1689m",
+        freeze_dinov3=True,
+        fast_num_tokens=64,
+        fast_adapter_layers=[3, 7, 11, 15, 19, 23],
+        slow_visual_dropout_probability=0.0,
+        slow_visual_dropout_final_probability=0.25,
+        slow_visual_dropout_anneal_start_step=500,
+        slow_visual_dropout_anneal_steps=2000,
         freeze_vision_encoder=False,
         freeze_language_encoder=False,
     )

@@ -7,23 +7,27 @@ from lerobot.policies.online_filtering_xvla.configuration_online_filtering_xvla 
     OnlineFilteringXVLAConfig,
 )
 from lerobot.policies.online_filtering_xvla.modeling_online_filtering_xvla import (
-    DelayConditionGate,
     OnlineFilteringXVLAPolicy,
+    XVLAFastAdapter,
     XVLAObservationPacket,
 )
 from lerobot.utils.constants import OBS_LANGUAGE_TOKENS
 
 
-def test_delay_condition_gate_starts_as_symmetric_average() -> None:
-    gate = DelayConditionGate(7)
-    value = gate(torch.tensor([0.0, 0.2]), torch.tensor([0.4, 1.0]), torch.tensor([1.0, 0.5]))
-    torch.testing.assert_close(value, torch.full((2, 7), 0.5))
+def test_fast_adapter_starts_as_exact_identity_and_keeps_prefix() -> None:
+    adapter = XVLAFastAdapter(8, 2)
+    action = torch.randn(2, 5, 8)
+    condition = torch.randn(2, 6, 8)
+    output = adapter(action, condition, torch.tensor([0, 3]))
+    torch.testing.assert_close(output, action)
+    (output.square().mean()).backward()
+    assert adapter.output_proj.weight.grad is not None
 
 
 def test_online_filtering_xvla_temporal_window() -> None:
-    config = OnlineFilteringXVLAConfig(chunk_size=30, n_action_steps=30, max_inference_delay=10)
-    assert config.image_observation_delta_indices == list(range(11))
-    assert config.state_observation_delta_indices == list(range(11))
+    config = OnlineFilteringXVLAConfig(chunk_size=30, n_action_steps=30, max_inference_delay=25)
+    assert config.image_observation_delta_indices == list(range(26))
+    assert config.state_observation_delta_indices == list(range(26))
     assert not config.freeze_vision_encoder
     assert not config.freeze_language_encoder
 
@@ -45,7 +49,7 @@ def test_online_xvla_assimilates_packet_and_commits_prefix() -> None:
             return torch.float32
 
         @staticmethod
-        def predict_endpoint_from_encoded(**kwargs):
+        def predict_endpoint(**kwargs):
             calls.append((kwargs["old_delay"].item(), kwargs["new_delay"].item()))
             return torch.ones_like(kwargs["particle"])
 
@@ -59,10 +63,18 @@ def test_online_xvla_assimilates_packet_and_commits_prefix() -> None:
     policy._take_online_packet = lambda delay, generation: OnlineFilteringXVLAPolicy._take_online_packet(
         policy, delay, generation
     )
-    condition = {"vlm_features": torch.zeros(1, 1, 2), "aux_visual_inputs": torch.zeros(1, 1, 2)}
-    policy._encode_runtime_condition = lambda batch: (
+    condition = {
+        "vlm_features": torch.zeros(1, 1, 2),
+        "aux_visual_inputs": torch.zeros(1, 1, 2),
+        "primary_visual_tokens": 1,
+    }
+    policy._slow_inputs = lambda batch: (
         condition,
         torch.zeros(1, 2),
+        torch.zeros(1, dtype=torch.long),
+    )
+    policy._encode_runtime_fast = lambda batch: (
+        torch.zeros(1, 1, 2),
         torch.zeros(1, dtype=torch.long),
     )
     batch = {OBS_LANGUAGE_TOKENS: torch.zeros(1, 2, dtype=torch.long)}
@@ -70,8 +82,7 @@ def test_online_xvla_assimilates_packet_and_commits_prefix() -> None:
     def callback(step, num_steps, generation):
         if step == 1:
             packet = XVLAObservationPacket(
-                condition={key: value + 1 for key, value in condition.items()},
-                proprio=torch.ones(1, 2),
+                tokens=torch.ones(1, 1, 2),
                 domain_id=torch.zeros(1, dtype=torch.long),
                 capture_step=1,
                 generation=generation,
@@ -88,4 +99,3 @@ def test_online_xvla_assimilates_packet_and_commits_prefix() -> None:
     assert output.shape == (1, 4, 2)
     assert calls == [(0, 0), (0, 1), (1, 1)]
     torch.testing.assert_close(output[:, 0], torch.zeros(1, 2))
-

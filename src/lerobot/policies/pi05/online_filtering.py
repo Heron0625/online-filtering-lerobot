@@ -516,7 +516,7 @@ def hard_commit_action_prefix(particle: Tensor, executed_actions: Tensor, delays
 
 
 class FastTokenResampler(nn.Module):
-    """Compress multi-camera initial/current DINO patch features into fast tokens."""
+    """Compress the current multi-camera DINO observation into spatial fast tokens."""
 
     def __init__(
         self,
@@ -542,7 +542,7 @@ class FastTokenResampler(nn.Module):
             self.position_proj = nn.Linear(2, output_dim)
             self.modality_embedding = nn.Parameter(torch.zeros(2, output_dim))
 
-        self.feature_proj = nn.Linear(3 * feature_dim, output_dim)
+        self.feature_proj = nn.Linear(feature_dim, output_dim)
         self.camera_embedding = nn.Parameter(torch.zeros(num_cameras, output_dim))
         self.queries = nn.Parameter(torch.randn(num_fast_tokens, output_dim) * 0.02)
         self.cross_attention = nn.MultiheadAttention(output_dim, num_heads, batch_first=True)
@@ -563,7 +563,6 @@ class FastTokenResampler(nn.Module):
 
     def forward(
         self,
-        initial_features: Tensor,
         current_features: Tensor,
         *,
         delays: Tensor,
@@ -573,17 +572,14 @@ class FastTokenResampler(nn.Module):
         """Return fast tokens of shape ``(B, num_fast_tokens, output_dim)``.
 
         Args:
-            initial_features: ``(B, cameras, patches, feature_dim)``.
-            current_features: Same shape as ``initial_features``.
+            current_features: ``(B, cameras, patches, feature_dim)``.
             delays: Integer or floating tensor with shape ``(B,)``.
             states: Optional latest proprioception with shape ``(B, state_dim)``.
             patch_mask: Optional valid-token mask ``(B, cameras, patches)``.
         """
-        if initial_features.shape != current_features.shape:
-            raise ValueError("initial_features and current_features must have identical shapes")
-        if initial_features.ndim != 4:
+        if current_features.ndim != 4:
             raise ValueError("DINO features must have shape (batch, cameras, patches, feature_dim)")
-        batch_size, cameras, patches, feature_dim = initial_features.shape
+        batch_size, cameras, patches, feature_dim = current_features.shape
         if cameras != self.num_cameras or feature_dim != self.feature_dim:
             raise ValueError(
                 f"expected cameras={self.num_cameras}, feature_dim={self.feature_dim}; "
@@ -592,10 +588,7 @@ class FastTokenResampler(nn.Module):
         if delays.shape != (batch_size,):
             raise ValueError(f"delays must have shape ({batch_size},), got {tuple(delays.shape)}")
 
-        residual_features = torch.cat(
-            [current_features, initial_features, current_features - initial_features], dim=-1
-        )
-        tokens = self.feature_proj(residual_features)
+        tokens = self.feature_proj(current_features)
         tokens = tokens + self.camera_embedding[None, :, None, :].to(tokens.dtype)
         if self.spatial_tokens:
             side = int(patches**0.5)
@@ -660,7 +653,7 @@ class FastTokenResampler(nn.Module):
 
 
 class FastObservationAdapter(nn.Module):
-    """Zero-initialized gated cross-attention for action-expert hidden states."""
+    """Zero-initialized residual cross-attention for action-expert hidden states."""
 
     def __init__(self, hidden_dim: int, num_heads: int = 8) -> None:
         super().__init__()
@@ -670,7 +663,6 @@ class FastObservationAdapter(nn.Module):
         self.fast_norm = nn.LayerNorm(hidden_dim)
         self.cross_attention = nn.MultiheadAttention(hidden_dim, num_heads, batch_first=True)
         self.output_proj = nn.Linear(hidden_dim, hidden_dim)
-        self.gate_mlp = nn.Sequential(nn.Linear(3, hidden_dim), nn.SiLU(), nn.Linear(hidden_dim, 1))
         nn.init.zeros_(self.output_proj.weight)
         nn.init.zeros_(self.output_proj.bias)
 
@@ -680,38 +672,21 @@ class FastObservationAdapter(nn.Module):
         fast_tokens: Tensor,
         *,
         delays: Tensor,
-        flow_times: Tensor,
-        observation_ages: Tensor | None = None,
     ) -> Tensor:
         batch_size, horizon, _ = action_hidden.shape
         if fast_tokens.shape[0] != batch_size:
             raise ValueError("action_hidden and fast_tokens batch sizes must match")
-        if delays.shape != (batch_size,) or flow_times.shape != (batch_size,):
-            raise ValueError("delays and flow_times must have shape (batch,)")
-        if observation_ages is None:
-            observation_ages = torch.zeros_like(flow_times)
+        if delays.shape != (batch_size,):
+            raise ValueError("delays must have shape (batch,)")
 
         correction, _ = self.cross_attention(
             self.action_norm(action_hidden), self.fast_norm(fast_tokens), self.fast_norm(fast_tokens)
         )
         positions = torch.arange(horizon, device=action_hidden.device).unsqueeze(0)
-        relative_position = (positions - delays.unsqueeze(1)).clamp(min=0).to(action_hidden.dtype)
-        relative_position = relative_position / (horizon - delays).clamp(min=1).unsqueeze(1).to(
-            action_hidden.dtype
-        )
-        gate_inputs = torch.stack(
-            [
-                flow_times.to(action_hidden.dtype).unsqueeze(1).expand(-1, horizon),
-                relative_position,
-                observation_ages.to(action_hidden.dtype).unsqueeze(1).expand(-1, horizon),
-            ],
-            dim=-1,
-        )
-        gate = torch.sigmoid(self.gate_mlp(gate_inputs))
         # The observation captured at physical step d cannot rewrite actions already executed
-        # at positions 0..d-1.  Use the same delay that conditions the gate as a hard mask.
+        # at positions 0..d-1. The hard mask is the only adapter gate.
         available = positions >= delays.unsqueeze(1)
-        correction = self.output_proj(correction) * gate * available.unsqueeze(-1)
+        correction = self.output_proj(correction) * available.unsqueeze(-1)
         return action_hidden + correction
 
 

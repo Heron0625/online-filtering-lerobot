@@ -123,7 +123,7 @@ class Attention(nn.Module):
         self.proj = nn.Linear(dim, dim)
         self.proj_drop = nn.Dropout(proj_drop)
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(self, x: torch.Tensor, key_padding_mask: torch.Tensor | None = None) -> torch.Tensor:
         """
         Parameters
         ----------
@@ -144,16 +144,29 @@ class Attention(nn.Module):
         q, k, v = qkv.unbind(0)  # each: [batch_size, num_heads, seq_len, head_dim]
         q, k = self.q_norm(q), self.k_norm(k)
 
+        attention_mask = None
+        if key_padding_mask is not None:
+            if key_padding_mask.shape != (batch_size, seq_len):
+                raise ValueError(
+                    "key_padding_mask must have shape "
+                    f"{(batch_size, seq_len)}, got {tuple(key_padding_mask.shape)}"
+                )
+            # SDPA boolean masks use True for entries which participate in attention.
+            attention_mask = (~key_padding_mask.bool())[:, None, None, :]
+
         if self.fused_attn:
             x = functional.scaled_dot_product_attention(
                 q,
                 k,
                 v,
+                attn_mask=attention_mask,
                 dropout_p=self.attn_drop.p if self.training else 0.0,
             )  # [batch_size, num_heads, seq_len, head_dim]
         else:
             q = q * self.scale
             attn = q @ k.transpose(-2, -1)  # [batch_size, num_heads, seq_len, seq_len]
+            if key_padding_mask is not None:
+                attn = attn.masked_fill(key_padding_mask[:, None, None, :], float("-inf"))
             attn = attn.softmax(dim=-1)
             attn = self.attn_drop(attn)
             x = attn @ v  # [batch_size, num_heads, seq_len, head_dim]
@@ -271,7 +284,7 @@ class TransformerBlock(nn.Module):
             drop=0.1,
         )
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(self, x: torch.Tensor, key_padding_mask: torch.Tensor | None = None) -> torch.Tensor:
         """
         Parameters
         ----------
@@ -281,7 +294,7 @@ class TransformerBlock(nn.Module):
         -------
         Tensor, [B, T, H]
         """
-        x = x + self.attn(self.norm1(x))
+        x = x + self.attn(self.norm1(x), key_padding_mask=key_padding_mask)
         x = x + self.mlp(self.norm2(x))
         return x
 

@@ -22,4 +22,3 @@ def reconcile_online_filtering_xvla_pretrained_processors(
 ) -> tuple[PolicyProcessorPipeline, PolicyProcessorPipeline]:
     """An XVLA processor is already compatible; temporal axes are retained by the dataset."""
     return preprocessor, postprocessor
-

@@ -31,10 +31,13 @@ CUDA_VISIBLE_DEVICES="$GPUS" accelerate launch --multi_gpu --num_processes="$PRO
   --policy.online_flow_phase=canonical \
   --policy.fast_spatial_tokens=true \
   --policy.fast_num_tokens=64 \
-  --policy.slow_visual_dropout_probability=0.25 \
+  --policy.slow_visual_dropout_probability=0.0 \
+  --policy.slow_visual_dropout_final_probability=0.25 \
+  --policy.slow_visual_dropout_anneal_start_step=500 \
+  --policy.slow_visual_dropout_anneal_steps=2000 \
   --policy.slow_visual_dropout_min=1.0 \
   --policy.slow_visual_dropout_max=1.0 \
-  --policy.max_inference_delay=10 \
+  --policy.max_inference_delay=25 \
   --policy.scheduler_warmup_steps=1000 \
   --policy.scheduler_decay_steps=30000 \
   --policy.freeze_dinov3=true \

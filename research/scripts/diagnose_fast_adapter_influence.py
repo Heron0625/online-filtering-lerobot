@@ -8,10 +8,10 @@ import json
 from pathlib import Path
 
 import torch
-import torch.nn.functional as F
+import torch.nn.functional as functional
+from diagnose_critical_full_replan import select_critical_events
 from torch.utils.data._utils.collate import default_collate
 
-from diagnose_critical_full_replan import select_critical_events
 from lerobot.datasets.lerobot_dataset import LeRobotDataset
 from lerobot.policies.factory import make_pre_post_processors
 from lerobot.policies.online_filtering_pi05.configuration_online_filtering_pi05 import (
@@ -25,6 +25,7 @@ from lerobot.utils.constants import ACTION, OBS_LANGUAGE_ATTENTION_MASK, OBS_LAN
 
 
 def main() -> None:
+    """Measure how fast-condition changes propagate through trained adapters."""
     parser = argparse.ArgumentParser()
     parser.add_argument("--checkpoint", required=True, type=Path)
     parser.add_argument("--output", required=True, type=Path)
@@ -151,26 +152,8 @@ def main() -> None:
                 def hook(module, hook_args, hook_kwargs, output):
                     action_hidden = hook_args[0]
                     correction = output - action_hidden
-                    flow_times = hook_kwargs["flow_times"]
                     adapter_delays = hook_kwargs["delays"]
-                    ages = hook_kwargs.get("observation_ages")
-                    if ages is None:
-                        ages = torch.zeros_like(flow_times)
-                    relative_position = (
-                        positions - adapter_delays.unsqueeze(1)
-                    ).clamp(min=0).to(action_hidden.dtype)
-                    relative_position = relative_position / (
-                        cfg.chunk_size - adapter_delays
-                    ).clamp(min=1).unsqueeze(1).to(action_hidden.dtype)
-                    gate_inputs = torch.stack(
-                        [
-                            flow_times.to(action_hidden.dtype).unsqueeze(1).expand(-1, cfg.chunk_size),
-                            relative_position,
-                            ages.to(action_hidden.dtype).unsqueeze(1).expand(-1, cfg.chunk_size),
-                        ],
-                        dim=-1,
-                    )
-                    gate = torch.sigmoid(module.gate_mlp(gate_inputs)).float()
+                    available = positions >= adapter_delays.unsqueeze(1)
                     current[layer_name] = {
                         "hidden_rms": action_hidden.float().square().mean().sqrt().item(),
                         "correction_rms": correction.float().square().mean().sqrt().item(),
@@ -178,9 +161,7 @@ def main() -> None:
                             correction.float().square().mean().sqrt()
                             / action_hidden.float().square().mean().sqrt().clamp_min(1e-12)
                         ).item(),
-                        "gate_mean": gate.mean().item(),
-                        "gate_min": gate.min().item(),
-                        "gate_max": gate.max().item(),
+                        "available_fraction": available.float().mean().item(),
                         "correction_tensor": correction.float().cpu(),
                     }
 
@@ -231,8 +212,8 @@ def main() -> None:
         normalized_shape = (correct_tokens.shape[-1],)
         # Measure the content contrast created by normalization in stable FP32;
         # the learned affine is shared by both conditions and is not needed here.
-        normalized_correct = F.layer_norm(correct_tokens, normalized_shape)
-        normalized_stale = F.layer_norm(stale_tokens, normalized_shape)
+        normalized_correct = functional.layer_norm(correct_tokens, normalized_shape)
+        normalized_stale = functional.layer_norm(stale_tokens, normalized_shape)
         report = {
             "checkpoint": str(args.checkpoint),
             "events": events,

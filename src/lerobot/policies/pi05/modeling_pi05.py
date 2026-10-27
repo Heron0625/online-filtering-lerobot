@@ -259,8 +259,6 @@ def compute_layer_complete(
                 out_emb,
                 fast_tokens,
                 delays=fast_delays,
-                flow_times=fast_flow_times,
-                observation_ages=fast_observation_ages,
             )
         after_first_residual = out_emb.clone()
         out_emb, gate = layernorm_forward(layer.post_attention_layernorm, out_emb, adarms_cond[i])
@@ -330,8 +328,6 @@ def forward_cached_expert_with_fast_adapters(
                 hidden_states,
                 fast_tokens,
                 delays=fast_delays,
-                flow_times=fast_flow_times,
-                observation_ages=fast_observation_ages,
             )
         after_attention = hidden_states.clone()
         hidden_states, gate = layernorm_forward(

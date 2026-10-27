@@ -11,21 +11,23 @@ from lerobot.policies.pi05.configuration_pi05 import PI05Config
 class OnlineFilteringPI05Config(PI05Config):
     """Observation-filtered PI0.5 configuration."""
 
-    max_inference_delay: int = 10
+    max_inference_delay: int = 25
     prompt_state_temporal_index: int = 0
 
     dinov3_model_id: str = "facebook/dinov3-vits16-pretrain-lvd1689m"
     freeze_dinov3: bool = True
     fast_encoder_device: str | None = None
     fast_image_size: int = 224
-    fast_num_tokens: int = 16
-    fast_spatial_tokens: bool = False  # Legacy checkpoints retain their original resampler.
+    fast_num_tokens: int = 64
+    fast_spatial_tokens: bool = True
     slow_visual_dropout_probability: float = 0.0
-    slow_visual_dropout_final_probability: float = 0.0
-    slow_visual_dropout_anneal_start_step: int = 0
-    slow_visual_dropout_anneal_steps: int = 0
+    slow_visual_dropout_final_probability: float = 0.25
+    slow_visual_dropout_anneal_start_step: int = 500
+    slow_visual_dropout_anneal_steps: int = 2000
     slow_visual_dropout_min: float = 0.5
     slow_visual_dropout_max: float = 0.75
+    main_delay_probability: float = 0.5
+    medium_delay_probability: float = 0.25
     fast_num_heads: int = 8
     fast_proprio_num_tokens: int = 1
     fast_proprio_hidden_dim: int = 256
@@ -33,7 +35,9 @@ class OnlineFilteringPI05Config(PI05Config):
     fast_image_mean: tuple[float, float, float] = (0.485, 0.456, 0.406)
     fast_image_std: tuple[float, float, float] = (0.229, 0.224, 0.225)
 
-    training_stage: str = "stage_a"
+    # The clean method is the unified two-condition vector field. ``stage_a`` and
+    # ``stage_b`` remain readable only for historical checkpoints.
+    training_stage: str = "online_flow"
     online_flow_phase: str = "canonical"
     online_flow_ema_decay: float = 0.999
     online_flow_rollout_steps: int = 4
@@ -98,6 +102,10 @@ class OnlineFilteringPI05Config(PI05Config):
             raise ValueError("slow visual dropout anneal steps must be non-negative")
         if not 0 <= self.slow_visual_dropout_min <= self.slow_visual_dropout_max <= 1:
             raise ValueError("slow visual dropout range must satisfy 0 <= min <= max <= 1")
+        if not 0 <= self.main_delay_probability <= 1:
+            raise ValueError("main_delay_probability must be in [0, 1]")
+        if not 0 <= self.medium_delay_probability <= 1 - self.main_delay_probability:
+            raise ValueError("delay mixture probabilities are invalid")
         if self.fast_proprio_num_tokens != 1:
             raise ValueError("the first online-filtering version requires one proprio token")
         if self.fast_proprio_hidden_dim < 1:

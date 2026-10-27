@@ -45,7 +45,7 @@ CUDA_VISIBLE_DEVICES="$GPUS" accelerate launch --multi_gpu --num_processes="$PRO
   --policy.slow_visual_dropout_anneal_steps=18000 \
   --policy.slow_visual_dropout_min=1.0 \
   --policy.slow_visual_dropout_max=1.0 \
-  --policy.max_inference_delay=10 \
+  --policy.max_inference_delay=25 \
   --policy.optimizer_lr=5e-6 \
   --policy.scheduler_warmup_steps="$WARMUP_STEPS" \
   --policy.scheduler_decay_steps="$STEPS" \
