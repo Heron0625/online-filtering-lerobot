@@ -1,0 +1,60 @@
+{
+  "model": "pi05",
+  "weights": "random initialization, full architecture",
+  "gpu": "NVIDIA GeForce RTX 3060",
+  "torch": "2.11.0+cu130",
+  "transformers": "5.5.4",
+  "python": "3.12.16",
+  "cameras": 4,
+  "input_resolution": [
+    480,
+    640
+  ],
+  "model_resolution": [
+    224,
+    224
+  ],
+  "batch_size": 1,
+  "state_dim": 16,
+  "action_dim": 16,
+  "token_tensor_length": 200,
+  "valid_tokens": 100,
+  "chunk_size": 50,
+  "denoise_steps": 10,
+  "compile": false,
+  "warmup": 3,
+  "iterations": 20,
+  "parameter_count": 4143404816,
+  "scope": "policy computation including image preprocessing; inputs already on GPU; excludes tokenizer, camera, IPC, robot",
+  "chunk_no_new_observations": {
+    "mean_ms": 641.7415150500346,
+    "p50_ms": 641.5259384998535,
+    "p95_ms": 645.6347394000204,
+    "min_ms": 637.2441120001895,
+    "max_ms": 647.6006960001541,
+    "samples_ms": [
+      640.178171000116,
+      640.9587289999763,
+      639.6510290005608,
+      637.2441120001895,
+      637.7950790001705,
+      639.2515339994134,
+      639.1910390002522,
+      642.2860049997325,
+      639.0662840003642,
+      647.6006960001541,
+      642.653146000157,
+      643.0215509999471,
+      644.8006939999686,
+      640.7183760002226,
+      639.322914999866,
+      642.0931479997307,
+      644.800103000307,
+      645.4344369994942,
+      645.5312680000134,
+      643.2319850000567
+    ],
+    "peak_allocated_gib": 8.926156520843506,
+    "peak_reserved_gib": 9.244140625
+  }
+}

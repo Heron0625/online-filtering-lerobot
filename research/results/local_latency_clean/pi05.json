@@ -1,0 +1,63 @@
+{
+  "model": "pi05",
+  "weights": "random initialization, full architecture",
+  "gpu": "NVIDIA GeForce RTX 3060",
+  "torch": "2.11.0+cu130",
+  "transformers": "5.5.4",
+  "python": "3.12.16",
+  "cameras": 4,
+  "input_resolution": [
+    480,
+    640
+  ],
+  "model_resolution": [
+    224,
+    224
+  ],
+  "batch_size": 1,
+  "state_dim": 16,
+  "action_dim": 16,
+  "token_tensor_length": 200,
+  "valid_tokens": 100,
+  "chunk_size": 50,
+  "denoise_steps": 10,
+  "compile": false,
+  "warmup": 3,
+  "iterations": 20,
+  "parameter_count": 4143404816,
+  "scope": "policy computation including image preprocessing; inputs already on GPU; excludes tokenizer, camera, IPC, robot",
+  "chunk_no_new_observations": {
+    "mean_ms": 645.7294079498752,
+    "p50_ms": 645.7003565001287,
+    "p95_ms": 650.8725245486858,
+    "min_ms": 638.5616589996062,
+    "max_ms": 654.8364480004238,
+    "samples_ms": [
+      640.0798929989833,
+      643.1794990003254,
+      638.5616589996062,
+      643.5926769991056,
+      642.9090889996587,
+      641.03436699952,
+      643.0173549997562,
+      654.8364480004238,
+      644.0883809991647,
+      645.3380639995885,
+      648.2646800013754,
+      646.0626490006689,
+      643.3011909994093,
+      650.5489619994478,
+      650.6638969985943,
+      646.958450000966,
+      647.4539860009827,
+      649.8498609998933,
+      647.5781939989247,
+      647.2688570011087
+    ],
+    "peak_allocated_gib": 8.926156520843506,
+    "peak_reserved_gib": 9.244140625
+  },
+  "source_commit": "ec5f32a97568577331fa40acdfbaffa67e8c53fe",
+  "source_branch": "origin/feature/clean-online-filtering-pi05-xvla",
+  "source_worktree": "/media/rpp/2955b89d-64af-4f7f-bd14-ae4d766151b2/home/robuster/wsvla/nas_data/project/online-filtering-latency-clean"
+}

@@ -1,0 +1,132 @@
+# π0.5 双臂推理：先修改 checkpoint 和 task。enabled: false 时只预测，不发动作。
+# action_hz 必须与训练数据 FPS 一致；command_hz 是机械臂命令频率。
+# 相机需沿用数采的驱动；本功能不自动启动相机。
+model:
+  checkpoint: /media/rpp/2955b89d-64af-4f7f-bd14-ae4d766151b2/home/robuster/wsvla/models/pi05_rb75/pretrained_model
+  task: 双臂遥操作任务
+  device: cuda
+  dtype: bfloat16
+  # 可选：覆盖训练服务器上的 tokenizer/DINO 路径；DINO 只需 config.json，权重从 checkpoint 加载。
+  tokenizer_name: null
+  dinov3_config: null
+  execute_steps: 10
+  startup_timeout_s: 300
+  prediction_timeout_s: 30
+control:
+  enabled: false
+  action_hz: 50
+  command_hz: 50
+  max_joint_speed_deg_s: 45
+  max_first_step_deg: 3
+  max_tracking_error_deg: 15
+  max_tick_lateness_s: 0.015
+  max_duration_s: 60
+  feedback_timeout_s: 0.3
+  ready_timeout_s: 10
+  gripper_enabled: true
+  gripper_min: 0.0
+  gripper_max: 1.0
+observation:
+  max_age_ms: 100
+  max_span_ms: 80
+runtime:
+  policy_repo: /media/rpp/2955b89d-64af-4f7f-bd14-ae4d766151b2/home/robuster/wsvla/nas_data/project/online-filtering-lerobot
+  ros_setup: /opt/ros/humble/setup.bash
+  workspace_setup: /home/rpp/collect_ws/install/setup.bash
+  ros_python: /usr/bin/python3
+  start_slave_arms: true
+  slave_executable: /opt/arm-servo-adapter/bin/slave_arm
+  start_bridge: true
+  bridge_command:
+  - zenoh-bridge-ros2dds
+  start_grippers: true
+  gripper_executable: /opt/arm-servo-adapter/bin/gripper_control
+  gripper_ports:
+    left: /dev/ttyUSB0
+    right: /dev/ttyUSB1
+  driver_log_dir: /home/rpp/rpp_logs/lerobot_infer
+  model_python: /media/rpp/2955b89d-64af-4f7f-bd14-ae4d766151b2/home/robuster/wsvla/nas_data/conda/envs/lerobot/bin/python
+  start_cameras: false
+  log_dir: /home/rpp/rpp_logs/lerobot_infer
+  cache_dir: /media/rpp/2955b89d-64af-4f7f-bd14-ae4d766151b2/home/robuster/wsvla/cache/huggingface
+robot:
+  left:
+    ip: 192.168.11.60
+    tcp_port: 8080
+    udp_port: 10001
+  right:
+    ip: 192.168.11.61
+    tcp_port: 8080
+    udp_port: 10002
+arms:
+  left:
+    feedback_topic: /vla_deviceea100/slave_arm/left/Joint_angle
+    command_topic: /vla_deviceea100/master_arm/left/Joint_angle
+    gripper_topic: /vla_deviceea100/arm/left/gripper_control
+  right:
+    feedback_topic: /vla_deviceea100/slave_arm/right/Joint_angle
+    command_topic: /vla_deviceea100/master_arm/right/Joint_angle
+    gripper_topic: /vla_deviceea100/arm/right/gripper_control
+streams:
+  state_left_joint:
+    topic: /vla_deviceea100/slave_arm/left/Joint_angle
+    type: trace_msgs/msg/JointAngle
+    field: angle
+    size: 7
+    scale: 0.017453292519943295
+  state_left_gripper:
+    topic: /vla_deviceea100/slave_arm/left/Gripper_position
+    type: trace_msgs/msg/GripperStatus
+    field: status
+    size: 1
+    scale: 1.0
+  state_right_joint:
+    topic: /vla_deviceea100/slave_arm/right/Joint_angle
+    type: trace_msgs/msg/JointAngle
+    field: angle
+    size: 7
+    scale: 0.017453292519943295
+  state_right_gripper:
+    topic: /vla_deviceea100/slave_arm/right/Gripper_position
+    type: trace_msgs/msg/GripperStatus
+    field: status
+    size: 1
+    scale: 1.0
+cameras:
+  head:
+    serial: '333422302343'
+    namespace: /vla_deviceea100/high_cam
+    topic: /vla_deviceea100/high_cam/camera/color/image_raw
+    width: 640
+    height: 480
+    fps: 60
+  chest:
+    serial: '246322304590'
+    namespace: /vla_deviceea100/chest_cam
+    topic: /vla_deviceea100/chest_cam/camera/color/image_raw
+    width: 640
+    height: 480
+    fps: 60
+  right:
+    serial: '337322070980'
+    namespace: /vla_deviceea100/right_cam
+    topic: /vla_deviceea100/right_cam/camera/color/image_raw
+    width: 640
+    height: 480
+    fps: 60
+  left:
+    serial: '337322073026'
+    namespace: /vla_deviceea100/left_cam
+    topic: /vla_deviceea100/left_cam/camera/color/image_raw
+    width: 640
+    height: 480
+    fps: 60
+training:
+  dataset_root: /云端数据目录/lerobot
+  repo_id: local/rb75_dual_arm
+  pretrained_path: lerobot/pi05_base
+  output_dir: /云端输出目录/pi05_rb75
+  batch_size: 4
+  steps: 30000
+  save_freq: 5000
+  num_workers: 4

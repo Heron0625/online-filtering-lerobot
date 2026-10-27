@@ -1,0 +1,138 @@
+# 所有话题均使用完整名称。数采不发布动作，沿用已经运行的主从遥操作。
+dataset:
+  fps: 50
+  save_dir: /media/rpp/2955b89d-64af-4f7f-bd14-ae4d766151b2/home/robuster/wsvla/nas_data/lerobot_rb75
+  repo_id: local/rb75_dual_arm
+  task: 双臂遥操作任务  # 采集前改为实际任务描述
+  jpeg_quality: 95
+runtime:
+  collector_python: /usr/bin/python3
+  converter_python: /home/rpp/miniconda3/envs/lerobot/bin/python
+  ros_setup: /opt/ros/humble/setup.bash
+  workspace_setup: /home/rpp/collect_ws/install/setup.bash
+  # 若相机已有节点发布话题，保持 false，避免重复占用设备。
+  start_cameras: false
+  start_slave_arms: false
+  slave_executable: /opt/arm-servo-adapter/bin/slave_arm
+  # 不自动启动远端主臂/夹爪控制，沿用现有遥操作流程。
+recording:
+  max_age_ms: 100       # 任一输入超时即判定当前 episode 无效
+  max_span_ms: 80       # 各输入本机接收时间的最大跨度
+  max_tick_lateness_ms: 15 # 超过此延迟停止当前段，避免压缩或补造时间轴
+  queue_size: 16        # 有界后台 JPEG/SQLite 写入队列，满则停止当前段
+  min_frames: 2
+  sync:
+    max_offset_ms: 15.0 # 优先匹配目标时刻 ±15ms 的新消息
+    max_span_ms: 20.0   # 优先配对跨度 20ms；沿用旧值时可超过，统计实际跨度
+    lookahead_ms: 25.0  # 延迟 25ms 优先配对，失败则按最近值采样
+    repeat_warning_steps: 3 # 同一路连续 3 步沿用旧值则严重告警；超 max_age_ms 才停止
+  frequency:
+    window_s: 1.0          # 开始前需积累完整窗口；采集中定期检查滑动窗口
+    tolerance_ratio: 0.05  # 目标频率的接收抖动容差
+    allow_faster: true     # 输入可高于目标频率，按固定 50Hz 配对采样；低频告警；偶发无新消息允许沿用最近值
+    max_gap_periods: 1.8   # 任意消息间隔超过目标周期的 1.8 倍，诊断为断帧并告警
+    report_interval_s: 2.0 # 采集中每 2 秒显示全部话题的实测 Hz
+robot:
+  type: realman_rb75_dual
+  joints_per_arm: 7
+  left: {ip: 192.168.11.60, tcp_port: 8080, udp_port: 10001}
+  right: {ip: 192.168.11.61, tcp_port: 8080, udp_port: 10002}
+# angle[0:7] 为关节角，消息第 8 个槽位不当作夹爪。
+# scale=0.01745... 将现有角度制 ROS 关节数据转换为弧度。
+# 夹爪暂保留原始单位；若需归一化，明确原始范围后修改 scale/offset。
+# action 夹爪沿用旧数采的 slave/.../Gripper_status（命令）；
+# observation 使用 slave/.../Gripper_position（反馈），不可互换。
+streams:
+  # 统一要求至少约 50Hz 数值输入；这里只声明检查目标，不改变外部驱动的发布频率。
+  # 若驱动实际配置为 100Hz，应在对应条目写 fps: 100，不能靠放宽容差通过。
+  state_left_joint:
+    fps: 50
+    topic: /vla_deviceea100/slave_arm/left/Joint_angle
+    type: trace_msgs/msg/JointAngle
+    field: angle
+    size: 7
+    scale: 0.017453292519943295
+  state_left_gripper:
+    fps: 50
+    topic: /vla_deviceea100/slave_arm/left/Gripper_position
+    type: trace_msgs/msg/GripperStatus
+    field: status
+    size: 1
+    scale: 1.0
+  state_right_joint:
+    fps: 50
+    topic: /vla_deviceea100/slave_arm/right/Joint_angle
+    type: trace_msgs/msg/JointAngle
+    field: angle
+    size: 7
+    scale: 0.017453292519943295
+  state_right_gripper:
+    fps: 50
+    topic: /vla_deviceea100/slave_arm/right/Gripper_position
+    type: trace_msgs/msg/GripperStatus
+    field: status
+    size: 1
+    scale: 1.0
+  action_left_joint:
+    fps: 50
+    topic: /vla_deviceea100/master_arm/left/Joint_angle
+    type: trace_msgs/msg/JointAngle
+    field: angle
+    size: 7
+    scale: 0.017453292519943295
+  action_left_gripper:
+    fps: 50
+    topic: /vla_deviceea100/slave_arm/left/Gripper_status
+    type: trace_msgs/msg/GripperStatus
+    field: status
+    size: 1
+    scale: 1.0
+  action_right_joint:
+    fps: 50
+    topic: /vla_deviceea100/master_arm/right/Joint_angle
+    type: trace_msgs/msg/JointAngle
+    field: angle
+    size: 7
+    scale: 0.017453292519943295
+  action_right_gripper:
+    fps: 50
+    topic: /vla_deviceea100/slave_arm/right/Gripper_status
+    type: trace_msgs/msg/GripperStatus
+    field: status
+    size: 1
+    scale: 1.0
+cameras:
+  head:
+    serial: '333422302343'
+    namespace: /vla_deviceea100/high_cam
+    topic: /vla_deviceea100/high_cam/camera/color/image_raw
+    width: 640
+    height: 480
+    fps: 60
+  chest:
+    serial: '246322304590'
+    namespace: /vla_deviceea100/chest_cam
+    topic: /vla_deviceea100/chest_cam/camera/color/image_raw
+    width: 640
+    height: 480
+    fps: 60
+  right:
+    serial: '337322070980'
+    namespace: /vla_deviceea100/right_cam
+    topic: /vla_deviceea100/right_cam/camera/color/image_raw
+    width: 640
+    height: 480
+    fps: 60
+  left:
+    serial: '337322073026'
+    namespace: /vla_deviceea100/left_cam
+    topic: /vla_deviceea100/left_cam/camera/color/image_raw
+    width: 640
+    height: 480
+    fps: 60
+
+# 转换阶段：四路相机并行编码，每路限制编码线程，避免争抢全部 CPU。
+conversion:
+  parallel_encoding: true
+  image_writer_threads: 4
+  encoder_threads: 2

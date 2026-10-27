@@ -1,0 +1,50 @@
+dataset:
+  # 填写 collect 产生的整个作业目录，或者其中的 lerobot/ 目录。
+  path: /media/rpp/2955b89d-64af-4f7f-bd14-ae4d766151b2/home/robuster/wsvla/nas_data/lerobot_rb75/10261644
+  joint_source: observation.state # 回放实际从臂轨迹；也可设为 action
+  speed_multiplier: 0.25          # 1.0 为录制速度；0.5 为半速
+runtime:
+  ros_setup: /opt/ros/humble/setup.bash
+  workspace_setup: /home/rpp/collect_ws/install/setup.bash
+  ros_python: /usr/bin/python3
+  dataset_python: /home/rpp/miniconda3/envs/lerobot/bin/python
+  start_slave_arms: true         # 自动启动缺失的从臂驱动；复用已运行的同侧实例
+  slave_executable: /opt/arm-servo-adapter/bin/slave_arm
+  start_bridge: true             # Zenoh 从臂驱动与 ROS2 回放之间的桥接
+  bridge_command: [zenoh-bridge-ros2dds]
+  start_grippers: true
+  gripper_executable: /opt/arm-servo-adapter/bin/gripper_control
+  gripper_ports: {left: /dev/ttyUSB0, right: /dev/ttyUSB1}
+  driver_log_dir: /home/rpp/rpp_logs/lerobot_reply
+robot:
+  left: {ip: 192.168.11.60, tcp_port: 8080, udp_port: 10001}
+  right: {ip: 192.168.11.61, tcp_port: 8080, udp_port: 10002}
+alignment:
+  speed_deg_s: 3.0               # 仅回到每段第一帧时使用，任一关节最大目标速度为 3°/秒
+  min_duration_s: 5.0            # 平滑起停，至少用 5 秒对齐；幅度较大时自动延长
+  tolerance_deg: 2.0
+  settle_timeout_s: 15.0         # 插值结束后等待实际关节到位
+playback:
+  command_hz: 50
+  feedback_timeout_s: 0.3
+  ready_timeout_s: 10.0
+  max_joint_speed_deg_s: 90.0    # 整段预检，超过则拒绝播放；可用半速回放降低速度
+  max_tracking_error_deg: 15.0
+  max_tick_lateness_s: 0.015     # 必须小于一个控制周期，不突发追赶多条命令
+  check_other_publishers: true
+  gripper_enabled: true
+  # 夹爪使用 action 的第 8/16 维（原始命令值），不使用 state 的位置反馈。
+  gripper_scale: 1.0
+  gripper_offset: 0.0
+  gripper_command_min: 0.0
+  gripper_command_max: 1.0
+  # 反馈角度是度；发布关节命令也是度，均与现有 servo adapter 一致。
+  arms:
+    left:
+      feedback_topic: /vla_deviceea100/slave_arm/left/Joint_angle
+      command_topic: /vla_deviceea100/master_arm/left/Joint_angle
+      gripper_topic: /vla_deviceea100/arm/left/gripper_control
+    right:
+      feedback_topic: /vla_deviceea100/slave_arm/right/Joint_angle
+      command_topic: /vla_deviceea100/master_arm/right/Joint_angle
+      gripper_topic: /vla_deviceea100/arm/right/gripper_control
