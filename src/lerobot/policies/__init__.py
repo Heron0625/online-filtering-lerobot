@@ -28,6 +28,9 @@ from .multi_task_dit.configuration_multi_task_dit import MultiTaskDiTConfig as M
 from .online_filtering_pi05.configuration_online_filtering_pi05 import (
     OnlineFilteringPI05Config as OnlineFilteringPI05Config,
 )
+from .online_filtering_xvla.configuration_online_filtering_xvla import (
+    OnlineFilteringXVLAConfig as OnlineFilteringXVLAConfig,
+)
 from .pi0.configuration_pi0 import PI0Config as PI0Config
 from .pi0_fast.configuration_pi0_fast import PI0FastConfig as PI0FastConfig
 from .pi05.configuration_pi05 import PI05Config as PI05Config
@@ -60,6 +63,7 @@ __all__ = [
     "PI0FastConfig",
     "PI05Config",
     "OnlineFilteringPI05Config",
+    "OnlineFilteringXVLAConfig",
     "SmolVLAConfig",
     "TDMPCConfig",
     "VLAJEPAConfig",

@@ -503,7 +503,17 @@ class XVLAPolicy(PreTrainedPolicy):
         elif embed_key in state_dict and shared_key not in state_dict:
             state_dict[shared_key] = state_dict[embed_key]
         # step 4: load into instance
-        instance.load_state_dict(state_dict, strict=True)
+        # ``strict=False`` is used by policies which extend XVLA with small online-
+        # conditioning modules while initializing the shared backbone from an XVLA
+        # checkpoint.  Stock XVLA loading remains strict by default at call sites
+        # which request it explicitly.
+        incompatible = instance.load_state_dict(state_dict, strict=strict)
+        if not strict and (incompatible.missing_keys or incompatible.unexpected_keys):
+            logging.info(
+                "Loaded XVLA checkpoint non-strictly (missing=%s, unexpected=%s)",
+                incompatible.missing_keys,
+                incompatible.unexpected_keys,
+            )
         logging.info("Loaded XVLA checkpoint")
         # step 5: finalize
         # Reapply dtype after loading state dict

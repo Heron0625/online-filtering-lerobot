@@ -28,6 +28,7 @@ from lerobot.utils.import_utils import _transformers_available, require_package
 
 # Conditional import for type checking and lazy loading
 if TYPE_CHECKING or _transformers_available:
+    from transformers import DynamicCache
     from transformers.models.auto import CONFIG_MAPPING
     from transformers.models.gemma import modeling_gemma
 
@@ -39,6 +40,7 @@ if TYPE_CHECKING or _transformers_available:
     )
 else:
     CONFIG_MAPPING = None
+    DynamicCache = None
     modeling_gemma = None
     PiGemmaForCausalLM = None
     _gated_residual = None
@@ -273,6 +275,112 @@ def compute_layer_complete(
         outputs_embeds.append(out_emb)
         start_pos = end_pos
     return outputs_embeds
+
+
+def forward_cached_expert_with_fast_adapters(
+    expert_model: nn.Module,
+    hidden_states: Tensor,
+    *,
+    attention_mask: Tensor,
+    position_ids: Tensor,
+    past_key_values,
+    adarms_cond: Tensor,
+    fast_adapters: nn.ModuleDict,
+    fast_tokens: Tensor,
+    fast_delays: Tensor,
+    fast_flow_times: Tensor,
+    fast_observation_ages: Tensor | None,
+) -> Tensor:
+    """Run only the action expert while reading a cached slow-prefix KV.
+
+    This mirrors the expert half of ``compute_layer_complete`` exactly, including
+    the trained adapter placement between attention and the MLP. The prefix cache
+    is cloned by the caller because Hugging Face cache updates append in place.
+    """
+    rotary_emb = expert_model.rotary_emb
+    for layer_index, layer in enumerate(expert_model.layers):
+        if hidden_states.dtype != layer.self_attn.q_proj.weight.dtype:
+            hidden_states = hidden_states.to(layer.self_attn.q_proj.weight.dtype)
+        residual = hidden_states
+        normalized, gate = layernorm_forward(layer.input_layernorm, hidden_states, adarms_cond)
+        input_shape = normalized.shape[:-1]
+        hidden_shape = (*input_shape, -1, layer.self_attn.head_dim)
+        query_states = layer.self_attn.q_proj(normalized).view(hidden_shape).transpose(1, 2)
+        key_states = layer.self_attn.k_proj(normalized).view(hidden_shape).transpose(1, 2)
+        value_states = layer.self_attn.v_proj(normalized).view(hidden_shape).transpose(1, 2)
+        cos, sin = rotary_emb(normalized, position_ids)
+        query_states, key_states = modeling_gemma.apply_rotary_pos_emb(
+            query_states, key_states, cos, sin
+        )
+        prefix_layer = past_key_values.layers[layer_index]
+        key_states = torch.cat((prefix_layer.keys, key_states), dim=2)
+        value_states = torch.cat((prefix_layer.values, value_states), dim=2)
+        attention_output, _ = modeling_gemma.eager_attention_forward(
+            layer.self_attn,
+            query_states,
+            key_states,
+            value_states,
+            attention_mask,
+            scaling=layer.self_attn.scaling,
+        )
+        attention_output = attention_output.reshape(*input_shape, -1).contiguous()
+        attention_output = layer.self_attn.o_proj(attention_output)
+        hidden_states = _gated_residual(residual, attention_output, gate)
+        adapter_key = str(layer_index)
+        if adapter_key in fast_adapters:
+            hidden_states = fast_adapters[adapter_key](
+                hidden_states,
+                fast_tokens,
+                delays=fast_delays,
+                flow_times=fast_flow_times,
+                observation_ages=fast_observation_ages,
+            )
+        after_attention = hidden_states.clone()
+        hidden_states, gate = layernorm_forward(
+            layer.post_attention_layernorm, hidden_states, adarms_cond
+        )
+        if hidden_states.dtype != layer.mlp.up_proj.weight.dtype:
+            hidden_states = hidden_states.to(layer.mlp.up_proj.weight.dtype)
+        hidden_states = layer.mlp(hidden_states)
+        hidden_states = _gated_residual(after_attention, hidden_states, gate)
+    hidden_states, _ = layernorm_forward(expert_model.norm, hidden_states, adarms_cond)
+    return hidden_states
+
+
+def prepare_joint_semantics_prefix_cache(
+    language_model: nn.Module,
+    prefix_embs: Tensor,
+    *,
+    attention_mask: Tensor,
+    position_ids: Tensor,
+):
+    """Prefill prefix K/V using the exact slow half of the trained joint loop."""
+    if DynamicCache is None:
+        require_package("transformers", extra="transformers-dep")
+    cache = DynamicCache()
+    hidden_states = prefix_embs
+    for layer in language_model.layers:
+        if hidden_states.dtype != layer.self_attn.q_proj.weight.dtype:
+            hidden_states = hidden_states.to(layer.self_attn.q_proj.weight.dtype)
+        residual = hidden_states
+        normalized, gate = layernorm_forward(layer.input_layernorm, hidden_states, None)
+        position_embeddings = language_model.rotary_emb(normalized, position_ids)
+        attention_output, _ = layer.self_attn(
+            hidden_states=normalized,
+            attention_mask=attention_mask,
+            position_ids=position_ids,
+            past_key_values=cache,
+            use_cache=True,
+            position_embeddings=position_embeddings,
+        )
+        hidden_states = _gated_residual(residual, attention_output, gate)
+        after_attention = hidden_states.clone()
+        hidden_states, gate = layernorm_forward(layer.post_attention_layernorm, hidden_states, None)
+        if hidden_states.dtype != layer.mlp.up_proj.weight.dtype:
+            hidden_states = hidden_states.to(layer.mlp.up_proj.weight.dtype)
+        hidden_states = layer.mlp(hidden_states)
+        hidden_states = _gated_residual(after_attention, hidden_states, gate)
+    return cache
 
 
 class GemmaConfig:  # see openpi `gemma.py: Config`
@@ -875,6 +983,7 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
         masks,
         states=None,
         state_masks=None,
+        fast_adapter_compatible: bool = False,
     ):
         """Embed the fixed slow condition once and return its reusable KV cache."""
         prefix_embs, prefix_pad_masks, prefix_att_masks = self.embed_prefix(
@@ -884,13 +993,21 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
         prefix_position_ids = torch.cumsum(prefix_pad_masks, dim=1) - 1
         prefix_att_2d_masks_4d = prepare_attention_masks_4d(prefix_att_2d_masks)
         self.paligemma_with_expert.paligemma.model.language_model.config._attn_implementation = "eager"  # noqa: SLF001
-        _, past_key_values = self.paligemma_with_expert.forward(
-            attention_mask=prefix_att_2d_masks_4d,
-            position_ids=prefix_position_ids,
-            past_key_values=None,
-            inputs_embeds=[prefix_embs, None],
-            use_cache=True,
-        )
+        if fast_adapter_compatible:
+            past_key_values = prepare_joint_semantics_prefix_cache(
+                self.paligemma_with_expert.paligemma.model.language_model,
+                prefix_embs,
+                attention_mask=prefix_att_2d_masks_4d,
+                position_ids=prefix_position_ids,
+            )
+        else:
+            _, past_key_values = self.paligemma_with_expert.forward(
+                attention_mask=prefix_att_2d_masks_4d,
+                position_ids=prefix_position_ids,
+                past_key_values=None,
+                inputs_embeds=[prefix_embs, None],
+                use_cache=True,
+            )
         return prefix_embs, prefix_pad_masks, past_key_values
 
     @torch.no_grad()  # see openpi `sample_actions` (slightly adapted)
@@ -986,11 +1103,21 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
             )
         suffix_embs, suffix_pad_masks, suffix_att_masks, adarms_cond = self.embed_suffix(x_t, model_time)
 
-        # The cached expert-only transformers path cannot invoke the fast adapters because
-        # they are inserted inside the joint PaliGemma/action-expert layer loop.  When fast
-        # conditioning is active, reuse the already embedded prefix but run that joint loop;
-        # otherwise inference would silently ignore every fast token.
-        if prefix_embs is not None and fast_tokens is not None and fast_delays is not None:
+        use_cached_fast_path = (
+            fast_adapters is not None
+            and fast_tokens is not None
+            and fast_delays is not None
+            and self.config.use_fast_prefix_kv_cache
+        )
+
+        # Compatibility path for numerical comparison and old deployments. It reuses
+        # prefix embeddings but recomputes all slow-language layers at every denoising query.
+        if (
+            prefix_embs is not None
+            and fast_tokens is not None
+            and fast_delays is not None
+            and not use_cached_fast_path
+        ):
             if (
                 self.paligemma_with_expert.paligemma.model.language_model.layers[
                     0
@@ -1038,6 +1165,23 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
 
         full_att_2d_masks_4d = prepare_attention_masks_4d(full_att_2d_masks)
         self.paligemma_with_expert.gemma_expert.model.config._attn_implementation = "eager"  # noqa: SLF001
+
+        if use_cached_fast_path:
+            suffix_out = forward_cached_expert_with_fast_adapters(
+                self.paligemma_with_expert.gemma_expert.model,
+                suffix_embs,
+                attention_mask=full_att_2d_masks_4d,
+                position_ids=position_ids,
+                past_key_values=past_key_values,
+                adarms_cond=adarms_cond,
+                fast_adapters=fast_adapters,
+                fast_tokens=fast_tokens,
+                fast_delays=fast_delays,
+                fast_flow_times=timestep,
+                fast_observation_ages=fast_observation_ages,
+            )
+            suffix_out = suffix_out[:, -self.config.chunk_size :].to(dtype=torch.float32)
+            return self.action_out_proj(suffix_out)
 
         past_key_values = clone_past_key_values(past_key_values)
         outputs_embeds, _ = self.paligemma_with_expert.forward(
