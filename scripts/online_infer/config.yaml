@@ -1,0 +1,183 @@
+# Independent online-filtering configuration; official infer/config.yaml is unchanged.
+# Confirm model.task against the training dataset before robot execution.
+#这边启动 server：
+# bash scripts/online_infer/run.sh --server
+# 等待“在线模型服务就绪”，那边启动独立 client：
+# cd /home/rpp/project_my/lerobot
+# bash scripts/online_infer/infer.sh --dry-run
+# 真机执行使用：
+# bash scripts/online_infer/infer.sh --execute
+# 沿用 → 初始化/开始、f 结束。新配置位于那边的 scripts/online_infer/config.yaml，已设置本次权重对应的任务和 25 Hz。
+model:
+  checkpoint: /media/rpp/2955b89d-64af-4f7f-bd14-ae4d766151b2/home/robuster/wsvla/nas_data/project/online-filtering-lerobot/ckpt/rm75_cube_bowls_pi05_ema_rollout_10k_25hz_20261109_gpu67/full8/checkpoints/010000/pretrained_model
+  task: Right arm puts the cube into bowl A and pushes A left; left arm stacks bowl
+    A on bowl B.
+  device: cuda
+  dtype: bfloat16
+  tokenizer_name: null
+  dinov3_config: /media/rpp/2955b89d-64af-4f7f-bd14-ae4d766151b2/home/robuster/wsvla/nas_data/project/online-filtering-lerobot/pretrain/dinov3-vits16-pretrain-lvd1689m
+  execute_steps: 50
+  replan_steps: 2
+  startup_timeout_s: 300
+  prediction_timeout_s: 300
+control:
+  action_smoothing:
+    enabled: true # 关节动作平滑开关；false 为原始下发行为，夹爪不参与平滑
+    alpha: 0.5 # 最终下发目标的 EMA 新目标权重；越小越平滑但滞后越大
+    max_step_deg: 1.0 # 每关节相邻下发指令最多变化 1 度（25Hz 下 25度/秒）；null 关闭限幅
+  input_recovery_timeout_s: 10.0
+  swap_action_arms: false
+  enabled: false
+  execution_hz: 25
+  max_first_step_deg: 25
+  max_tracking_error_deg: 25
+  max_tick_lateness_s: 0.015
+  max_duration_s: 500
+  feedback_timeout_s: 0.3
+  ready_timeout_s: 10
+  gripper_enabled: true
+  gripper_mode: continuous
+  gripper_threshold: 0.5
+  gripper_filter:
+    enabled: true
+    close_threshold: 0.35
+    open_threshold: 0.65
+    confirm_s: 0.12
+    min_command_interval_s: 2
+  gripper_prediction_tolerance: 0.1
+  gripper_min: 0.0
+  gripper_max: 1.0
+observation:
+  max_age_ms: 100
+  max_span_ms: 80
+runtime:
+  policy_repo: /media/rpp/2955b89d-64af-4f7f-bd14-ae4d766151b2/home/robuster/wsvla/nas_data/project/online-filtering-lerobot
+  ros_setup: /opt/ros/humble/setup.bash
+  workspace_setup: /home/rpp/collect_ws/install/setup.bash
+  ros_python: /usr/bin/python3
+  start_slave_arms: true
+  slave_executable: /opt/arm-servo-adapter/bin/slave_arm
+  start_bridge: true
+  bridge_command:
+  - zenoh-bridge-ros2dds
+  start_grippers: false
+  gripper_initial_state: close
+  gripper_executable: /opt/arm-servo-adapter/bin/gripper_control
+  gripper_ports:
+    left: /dev/ttyUSB0
+    right: /dev/ttyUSB1
+  driver_log_dir: /home/rpp/rpp_logs/lerobot_infer
+  model_python: /media/rpp/2955b89d-64af-4f7f-bd14-ae4d766151b2/home/robuster/wsvla/nas_data/conda/envs/lerobot/bin/python
+  start_cameras: false
+  log_dir: /home/rpp/rpp_logs/lerobot_infer
+  cache_dir: /media/rpp/2955b89d-64af-4f7f-bd14-ae4d766151b2/home/robuster/wsvla/cache/huggingface
+robot:
+  left:
+    ip: 192.168.11.60
+    tcp_port: 8080
+    udp_port: 10001
+  right:
+    ip: 192.168.11.61
+    tcp_port: 8080
+    udp_port: 10002
+arms:
+  left:
+    feedback_topic: /vla_deviceea100/slave_arm/left/Joint_angle
+    command_topic: /vla_deviceea100/master_arm/left/Joint_angle
+    gripper_topic: /vla_deviceea100/arm/left/gripper_control
+  right:
+    feedback_topic: /vla_deviceea100/slave_arm/right/Joint_angle
+    command_topic: /vla_deviceea100/master_arm/right/Joint_angle
+    gripper_topic: /vla_deviceea100/arm/right/gripper_control
+streams:
+  state_left_joint:
+    topic: /vla_deviceea100/slave_arm/left/Joint_angle
+    type: trace_msgs/msg/JointAngle
+    field: angle
+    size: 7
+    scale: 0.017453292519943295
+  state_right_joint:
+    topic: /vla_deviceea100/slave_arm/right/Joint_angle
+    type: trace_msgs/msg/JointAngle
+    field: angle
+    size: 7
+    scale: 0.017453292519943295
+cameras:
+  head:
+    serial: '333422302343'
+    namespace: /vla_deviceea100/high_cam
+    topic: /vla_deviceea100/high_cam/camera/color/image_raw
+    width: 640
+    height: 480
+    fps: 60
+  chest:
+    serial: '246322304590'
+    namespace: /vla_deviceea100/chest_cam
+    topic: /vla_deviceea100/chest_cam/camera/color/image_raw
+    width: 640
+    height: 480
+    fps: 60
+  right:
+    serial: '337322070980'
+    namespace: /vla_deviceea100/right_cam
+    topic: /vla_deviceea100/right_cam/camera/color/image_raw
+    width: 640
+    height: 480
+    fps: 60
+  left:
+    serial: '337322073026'
+    namespace: /vla_deviceea100/left_cam
+    topic: /vla_deviceea100/left_cam/camera/color/image_raw
+    width: 640
+    height: 480
+    fps: 60
+training:
+  dataset_root: "/\u4E91\u7AEF\u6570\u636E\u76EE\u5F55/lerobot"
+  repo_id: local/rb75_dual_arm
+  pretrained_path: lerobot/pi05_base
+  output_dir: "/\u4E91\u7AEF\u8F93\u51FA\u76EE\u5F55/pi05_rb75"
+  batch_size: 4
+  steps: 30000
+  save_freq: 5000
+  num_workers: 4
+initial_pose:
+  enabled: true
+  mode: servo
+  speed_deg_s: 5.0
+  min_duration_s: 5.0
+  speed_percent: 5
+  sdk_library: /opt/arm-servo-adapter/lib/libapi_cpp.so
+  tolerance_deg: 2.0
+  timeout_s: 60.0
+  left_degrees:
+  - -40.888
+  - 19.775
+  - 29.22
+  - 121.291
+  - -21.143
+  - 49.038
+  - 7.918
+  right_degrees:
+  - 31.018
+  - 22.935
+  - -24.518
+  - 113.903
+  - 17.925
+  - 48.51
+  - 3.999
+realman_gripper:
+  enabled: true
+  position_tolerance: 10
+  sdk_library: /opt/arm-servo-adapter/lib/libapi_cpp.so
+  speed: 200
+  force: 50
+gripper_initialization:
+  enabled: true
+  wait_s: 2.0
+online:
+  log_assimilated_details: false # false 只打印吸收次数；true 打印 [去噪步, 观测相对执行步] 列表
+  legacy_infer_dir: /home/rpp/project_my/lerobot/scripts/infer
+  address: unix:/tmp/lerobot_online_rpp/policy.sock
+  fast_observation_hz: 25
+  clock_max_uncertainty_s: 0.02
+  max_observation_age_s: 0.5

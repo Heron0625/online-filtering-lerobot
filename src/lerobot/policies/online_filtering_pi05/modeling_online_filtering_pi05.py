@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import copy
+import math
 import time as wall_time
 
 import torch
@@ -1393,6 +1394,12 @@ class OnlineFilteringPI05Policy(PI05Policy):
             raise ValueError("continuous observations require at least two denoising steps")
         assimilation_callback = kwargs.pop("assimilation_callback", None)
         observation_age_override = kwargs.pop("observation_age_override", None)
+        initial_capture_timestamp = kwargs.pop("initial_capture_timestamp", None)
+        if initial_capture_timestamp is not None and (
+            not math.isfinite(float(initial_capture_timestamp))
+            or float(initial_capture_timestamp) > wall_time.monotonic()
+        ):
+            raise ValueError("initial_capture_timestamp must be finite and not in the future")
         if observation_age_override is not None and observation_age_override < 0:
             raise ValueError("observation_age_override must be non-negative")
         if kwargs:
@@ -1402,7 +1409,9 @@ class OnlineFilteringPI05Policy(PI05Policy):
                 (1, self.config.chunk_size, self.config.max_action_dim), tokens.device
             )
 
-        initial_timestamp = wall_time.monotonic()
+        initial_timestamp = (
+            wall_time.monotonic() if initial_capture_timestamp is None else float(initial_capture_timestamp)
+        )
         current_fast_tokens = self._make_single_fast_tokens(batch, delay=0)
         current_version = 0
         current_capture_timestamp = initial_timestamp
