@@ -15,8 +15,9 @@ from lerobot.policies.pi05.online_filtering import (
 from lerobot.utils.constants import OBS_LANGUAGE_ATTENTION_MASK, OBS_LANGUAGE_TOKENS, OBS_STATE
 
 
-@pytest.mark.parametrize("stage", ["stage_a", "stage_b"])
-def test_multiple_packets_assimilated_before_later_denoising_steps(stage):
+@pytest.mark.parametrize("stage", ["stage_a", "stage_b", "online_flow"])
+@pytest.mark.parametrize("delivery", ["buffered", "direct"])
+def test_multiple_packets_assimilated_before_later_denoising_steps(stage, delivery):
     updates, denoise_calls, assimilations = [], [], []
 
     def updater(x, **kwargs):
@@ -51,6 +52,7 @@ def test_multiple_packets_assimilated_before_later_denoising_steps(stage):
         posterior_slow_resampler=lambda *args: torch.zeros(1, 1, 4),
         _make_posterior_condition_tokens=lambda *args: torch.zeros(1, 3, 4),
         posterior_updater=updater,
+        _make_online_condition_tokens=lambda old, new, *args: torch.cat([old, new], dim=1),
         fast_observation_buffer=FastObservationBuffer(),
     )
     batch = {
@@ -64,18 +66,21 @@ def test_multiple_packets_assimilated_before_later_denoising_steps(stage):
         if step not in [1, 3]:
             return
         timestamp = time.monotonic()
-        fake.fast_observation_buffer.push(
-            FastObservationPacket(
-                tokens=torch.ones(1, 1, 4) * step,
-                capture_step=step,
-                capture_timestamp=timestamp,
-                ready_timestamp=timestamp,
-                proprio=batch[OBS_STATE],
-                camera_valid_mask=torch.ones(1, dtype=torch.bool),
-                generation=generation,
-                executed_prefix=torch.full((1, step, 2), 10.0),
-            )
+        packet = FastObservationPacket(
+            tokens=torch.ones(1, 1, 4) * step,
+            capture_step=step,
+            capture_timestamp=timestamp,
+            ready_timestamp=timestamp,
+            proprio=batch[OBS_STATE],
+            camera_valid_mask=torch.ones(1, dtype=torch.bool),
+            generation=generation,
+            executed_prefix=torch.full((1, step, 2), 10.0),
         )
+        if delivery == "direct":
+            return packet
+        fake.fast_observation_buffer.push(packet)
+        return None
+
 
     result = OnlineFilteringPI05Policy.predict_action_chunk(
         fake,

@@ -39,6 +39,7 @@ from ..utils import populate_queues
 from .action_hub import build_action_space
 from .configuration_xvla import XVLAConfig
 from .soft_transformer import SoftPromptedTransformer
+from .utils import libero_state_to_xvla_proprio
 
 # Florence2 config and modeling depend on transformers
 if TYPE_CHECKING or _transformers_available:
@@ -163,6 +164,7 @@ class XVLAModel(nn.Module):
         input_ids: torch.LongTensor,
         pixel_values: torch.FloatTensor,
         image_mask: torch.Tensor,
+        visual_drop_mask: torch.Tensor | None = None,
     ) -> dict[str, torch.Tensor]:
         """
         Encode text and multi-view images via Florence2 encoder.
@@ -181,11 +183,19 @@ class XVLAModel(nn.Module):
         image_features = valid_feats.new_zeros((batch_size * num_views, tokens_per_view, hidden_dim))
         image_features[flat_mask] = valid_feats
         image_features = image_features.view(batch_size, num_views, tokens_per_view, hidden_dim)
+        if visual_drop_mask is not None:
+            if visual_drop_mask.shape != (batch_size,):
+                raise ValueError("visual_drop_mask must have shape (batch_size,)")
+            visual_drop_mask = visual_drop_mask.to(device=image_features.device, dtype=torch.bool)
+            image_features = image_features.masked_fill(visual_drop_mask[:, None, None, None], 0)
         inputs_embeds = self.vlm.get_input_embeddings()(input_ids)
 
         # XVLA prepends the primary view's image tokens to the text embeddings and attends to everything.
         merged_embeds = torch.cat([image_features[:, 0], inputs_embeds], dim=1)
         attention_mask = torch.ones(merged_embeds.shape[:2], dtype=torch.long, device=merged_embeds.device)
+
+        if visual_drop_mask is not None:
+            attention_mask[:, :tokens_per_view] = (~visual_drop_mask[:, None]).long()
 
         enc_out = self.vlm.language_model.encoder(
             attention_mask=attention_mask,
@@ -203,6 +213,7 @@ class XVLAModel(nn.Module):
         domain_id: torch.LongTensor,
         proprio: torch.Tensor,
         action: torch.Tensor,
+        action_is_pad: torch.Tensor | None = None,
     ) -> dict[str, torch.Tensor]:
         """
         Forward pass for the XVLA model.
@@ -230,7 +241,15 @@ class XVLAModel(nn.Module):
             proprio=proprio_m,
             **enc,
         )
-        return self.action_space.compute_loss(pred_action, action)
+        if action_is_pad is None:
+            return self.action_space.compute_loss(pred_action, action)
+
+        valid = ~action_is_pad.to(device=action.device, dtype=torch.bool)
+        if not valid.any():
+            raise ValueError("batch contains no valid action targets")
+        # Flatten all valid tokens together so short episode-tail rows do not
+        # receive the same weight as rows containing a full action horizon.
+        return self.action_space.compute_loss(pred_action[valid].unsqueeze(0), action[valid].unsqueeze(0))
 
     @torch.no_grad()
     def generate_actions(
@@ -305,7 +324,9 @@ class XVLAPolicy(PreTrainedPolicy):
             return torch.zeros(batch_size, 0, device=device)
         state = batch[OBS_STATE]
         if state.ndim > 2:
-            state = state[:, -1, :]
+            state = state[:, 0, :]
+        if state.shape[-1] == 8:
+            state = libero_state_to_xvla_proprio(state)
         return pad_vector(state, self.model.dim_proprio, truncate=True)
 
     def _prepare_images(self, batch: dict[str, Tensor]) -> tuple[Tensor, Tensor]:
@@ -370,9 +391,36 @@ class XVLAPolicy(PreTrainedPolicy):
         if actions.ndim == 2:
             actions = actions.unsqueeze(1)
         actions = pad_tensor_along_dim(actions, self.config.chunk_size, dim=1)
+        if actions.shape[-1] == 7 and self.config.action_mode.lower() == "ee6d":
+            raise ValueError(
+                "LIBERO absolute targets require full-episode controller history. Convert the dataset with "
+                "research/scripts/convert_libero_lerobot_to_xvla.py before training; "
+                "random action windows cannot reconstruct preceding zero-rotation goals."
+            )
         if actions.shape[-1] != self.model.dim_action:
             actions = pad_vector(actions, self.model.dim_action, truncate=True)
         return actions
+
+    def _action_target_pad_mask(self, batch: dict[str, Tensor]) -> Tensor | None:
+        """Combine raw-action and future-state padding for absolute targets."""
+        masks = []
+        target_valid = batch.get(self.config.action_validity_feature)
+        if target_valid is not None:
+            if target_valid.ndim != 2:
+                raise ValueError("X-VLA action validity must be sampled over the action horizon")
+            masks.append(~target_valid[:, : self.config.chunk_size].bool())
+        action_pad = batch.get("action_is_pad")
+        if action_pad is not None:
+            masks.append(action_pad[:, : self.config.chunk_size].bool())
+        state_pad = batch.get(f"{OBS_STATE}_is_pad")
+        if state_pad is not None and state_pad.ndim == 2:
+            masks.append(state_pad[:, : self.config.chunk_size].bool())
+        if not masks:
+            return None
+        result = masks[0]
+        for mask in masks[1:]:
+            result = result | mask
+        return result
 
     def _build_model_inputs(self, batch: dict[str, Tensor]) -> dict[str, Tensor]:
         input_ids = batch[OBS_LANGUAGE_TOKENS]
@@ -391,7 +439,7 @@ class XVLAPolicy(PreTrainedPolicy):
     def forward(self, batch: dict[str, Tensor]) -> tuple[Tensor, dict]:
         inputs = self._build_model_inputs(batch)
         targets = self._prepare_action_targets(batch)
-        losses = self.model(action=targets, **inputs)
+        losses = self.model(action=targets, action_is_pad=self._action_target_pad_mask(batch), **inputs)
         total_loss = sum(losses.values())
 
         log_dict = {k: v.detach().item() for k, v in losses.items()}

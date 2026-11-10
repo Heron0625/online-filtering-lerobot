@@ -4,6 +4,7 @@ from dataclasses import dataclass
 
 from lerobot.configs import PreTrainedConfig
 from lerobot.policies.pi05.configuration_pi05 import PI05Config
+from lerobot.utils.delay_sampling import validate_delay_distribution
 
 
 @PreTrainedConfig.register_subclass("online_filtering_pi05")
@@ -13,6 +14,8 @@ class OnlineFilteringPI05Config(PI05Config):
 
     max_inference_delay: int = 25
     prompt_state_temporal_index: int = 0
+    delay_sampling_ranges: tuple[tuple[int, int], ...] | None = None
+    delay_sampling_probabilities: tuple[float, ...] | None = None
 
     dinov3_model_id: str = "facebook/dinov3-vits16-pretrain-lvd1689m"
     freeze_dinov3: bool = True
@@ -84,6 +87,9 @@ class OnlineFilteringPI05Config(PI05Config):
                 "max_inference_delay must satisfy "
                 f"0 <= delay < chunk_size ({self.chunk_size}), got {self.max_inference_delay}"
             )
+        validate_delay_distribution(
+            self.delay_sampling_ranges, self.delay_sampling_probabilities, self.max_inference_delay
+        )
         if self.use_visual_memory or self.use_proprioceptive_memory:
             raise ValueError("online_filtering_pi05 does not combine Stage-A windows with PI0.5 MEM")
         if self.fast_image_size < 1 or self.fast_num_tokens < 1:
@@ -120,6 +126,8 @@ class OnlineFilteringPI05Config(PI05Config):
             raise ValueError("training_stage must be 'stage_a', 'stage_b', or 'online_flow'")
         if self.online_flow_phase not in {"canonical", "ema_rollout"}:
             raise ValueError("online_flow_phase must be 'canonical' or 'ema_rollout'")
+        if self.training_stage == "online_flow" and self.num_inference_steps < 2:
+            raise ValueError("online_flow requires at least two inference steps")
         if not 0 < self.online_flow_ema_decay < 1:
             raise ValueError("online_flow_ema_decay must be in (0, 1)")
         if not 1 <= self.online_flow_rollout_steps <= self.num_inference_steps:
@@ -151,7 +159,9 @@ class OnlineFilteringPI05Config(PI05Config):
             raise ValueError("stage_b_min_gap must be positive")
         if self.stage_b_max_gap is None:
             self.stage_b_max_gap = self.max_inference_delay
-        if not self.stage_b_min_gap <= self.stage_b_max_gap <= self.max_inference_delay:
+        if self.training_stage == "stage_b" and not (
+            self.stage_b_min_gap <= self.stage_b_max_gap <= self.max_inference_delay
+        ):
             raise ValueError("Stage-B gaps must satisfy 1 <= min_gap <= max_gap <= max_inference_delay")
         if self.posterior_hidden_dim % self.posterior_num_heads != 0:
             raise ValueError("posterior_hidden_dim must be divisible by posterior_num_heads")
@@ -159,11 +169,14 @@ class OnlineFilteringPI05Config(PI05Config):
             raise ValueError("posterior_num_layers must be positive")
         if self.posterior_slow_tokens < 1:
             raise ValueError("posterior_slow_tokens must be positive")
-        if min(
-            self.posterior_endpoint_weight,
-            self.posterior_relative_weight,
-            self.posterior_cosine_weight,
-        ) < 0:
+        if (
+            min(
+                self.posterior_endpoint_weight,
+                self.posterior_relative_weight,
+                self.posterior_cosine_weight,
+            )
+            < 0
+        ):
             raise ValueError("posterior loss weights must be non-negative")
         if self.posterior_relative_floor <= 0:
             raise ValueError("posterior_relative_floor must be positive")

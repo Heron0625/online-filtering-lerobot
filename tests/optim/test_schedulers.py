@@ -106,3 +106,21 @@ def test_save_load_scheduler_state(scheduler, tmp_path):
     loaded_scheduler = load_scheduler_state(scheduler, tmp_path)
 
     assert scheduler.state_dict() == loaded_scheduler.state_dict()
+
+
+def test_short_run_can_preserve_long_run_cosine_schedule(optimizer):
+    config = CosineDecayWithWarmupSchedulerConfig(
+        num_warmup_steps=1000,
+        num_decay_steps=30000,
+        peak_lr=1e-4,
+        decay_lr=2.5e-6,
+        scale_to_training_steps=False,
+    )
+    short = config.build(optimizer, num_training_steps=10000)
+    long = config.build(optimizer, num_training_steps=30000)
+    for step in [0, 333, 999, 1000, 5000, 10000]:
+        assert short.lr_lambdas[0](step) == long.lr_lambdas[0](step)
+    auto = CosineDecayWithWarmupSchedulerConfig(
+        num_warmup_steps=1000, num_decay_steps=30000, peak_lr=1e-4, decay_lr=2.5e-6
+    ).build(optimizer, num_training_steps=10000)
+    assert auto.lr_lambdas[0](333) != short.lr_lambdas[0](333)

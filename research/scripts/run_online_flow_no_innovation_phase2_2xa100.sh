@@ -25,12 +25,12 @@ WARMUP_STEPS=${PHASE2_WARMUP_STEPS:-300}
 CUDA_VISIBLE_DEVICES="$GPUS" accelerate launch --multi_gpu --num_processes="$PROCESSES" \
   -m lerobot.scripts.lerobot_train \
   --dataset.repo_id=lerobot/libero \
-  --dataset.root=/data/zhoukai/dataset/libero \
+  --dataset.root=/data/yhr/pretrain/recovered_zhoukai/dataset/libero \
   --dataset.video_backend=torchcodec \
   --policy.type=online_filtering_pi05 \
   --policy.pretrained_path="$SOURCE" \
-  --policy.dinov3_model_id=/data/zhoukai/pretrain/dinov3-vits16-pretrain-lvd1689m \
-  --policy.tokenizer_name=/data/zhoukai/pretrain/paligemma-tokenizer \
+  --policy.dinov3_model_id=/data/yhr/pretrain/dinov3-vits16-pretrain-lvd1689m \
+  --policy.tokenizer_name=/data/yhr/pretrain/recovered_zhoukai/pretrain/paligemma-tokenizer \
   --policy.training_stage=online_flow \
   --policy.online_flow_phase=ema_rollout \
   --policy.online_flow_ema_decay=0.999 \

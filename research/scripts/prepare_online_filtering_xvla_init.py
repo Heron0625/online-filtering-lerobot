@@ -48,6 +48,14 @@ def main() -> None:
     for name in ("policy_preprocessor.json", "policy_postprocessor.json"):
         shutil.copy2(args.source / name, args.output / name)
     os.symlink((args.source / "model.safetensors").resolve(), args.output / "model.safetensors")
+    # Saved LeRobot checkpoints may keep processor-owned artifacts next to the
+    # processor JSON (for example the local tokenizer and normalization stats).
+    # Preserve those relative references without duplicating immutable files.
+    for artifact in args.source.iterdir():
+        if artifact.name == "tokenizer" or artifact.name.startswith(
+            ("policy_preprocessor_step_", "policy_postprocessor_step_")
+        ):
+            os.symlink(artifact.resolve(), args.output / artifact.name)
 
 
 if __name__ == "__main__":

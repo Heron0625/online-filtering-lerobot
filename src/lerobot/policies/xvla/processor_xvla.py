@@ -65,6 +65,7 @@ def make_xvla_pre_post_processors(
             padding=config.pad_language_to,
             padding_side=config.tokenizer_padding_side,
         ),
+        XVLADatasetImageOrientationProcessorStep(),
         XVLAImageToFloatProcessorStep(),
         XVLAImageNetNormalizeProcessorStep(),
         XVLAAddDomainIdProcessorStep(),
@@ -79,7 +80,73 @@ def make_xvla_pre_post_processors(
     return make_policy_processor_pipelines(input_steps=input_steps, output_steps=output_steps)
 
 
+def reconcile_xvla_pretrained_processors(
+    config: XVLAConfig,
+    preprocessor: PolicyProcessorPipeline,
+    postprocessor: PolicyProcessorPipeline,
+) -> tuple[PolicyProcessorPipeline, PolicyProcessorPipeline]:
+    """Restore image processing omitted by the converted LeRobot checkpoint JSON.
+
+    The official X-VLA training pipeline applies ``ToTensor`` followed by
+    ImageNet normalization.  Early LeRobot-converted checkpoints serialize
+    neither image step, so loading their JSON verbatim is insufficient for
+    fine-tuning.  Insert each missing step exactly once while retaining the
+    checkpoint's tokenizer length and domain id.
+    """
+    del config
+    existing = {type(step) for step in preprocessor.steps}
+    additions = []
+    if XVLADatasetImageOrientationProcessorStep not in existing:
+        additions.append(XVLADatasetImageOrientationProcessorStep())
+    if XVLAImageToFloatProcessorStep not in existing:
+        additions.append(XVLAImageToFloatProcessorStep())
+    if XVLAImageNetNormalizeProcessorStep not in existing:
+        additions.append(XVLAImageNetNormalizeProcessorStep())
+    if additions:
+        insert_at = next(
+            (
+                index
+                for index, step in enumerate(preprocessor.steps)
+                if isinstance(step, XVLAAddDomainIdProcessorStep)
+            ),
+            len(preprocessor.steps),
+        )
+        preprocessor.steps[insert_at:insert_at] = additions
+    return preprocessor, postprocessor
+
+
 # Custom XVLA processor steps
+XVLA_WRIST_FLIP_KEY = "observation.xvla_wrist_flip"
+
+
+@dataclass
+@ProcessorStepRegistry.register(name="xvla_dataset_image_orientation")
+class XVLADatasetImageOrientationProcessorStep(ObservationProcessorStep):
+    """Consume an explicit dataset flag; simulator/replayed images stay untouched."""
+
+    def observation(self, observation):
+        observation = observation.copy()
+        flag = observation.pop(XVLA_WRIST_FLIP_KEY, None)
+        if flag is None:
+            return observation
+        key = f"{OBS_IMAGES}.image2"
+        if key not in observation:
+            raise ValueError("X-VLA wrist orientation flag requires observation.images.image2")
+        image = observation[key]
+        flag = torch.as_tensor(flag, device=image.device).bool().reshape(image.shape[0], -1)
+        if not (flag == flag[:, :1]).all():
+            raise ValueError("wrist orientation must be constant across each observation history")
+        mask = flag[:, 0].reshape(image.shape[0], *([1] * (image.ndim - 1)))
+        observation[key] = torch.where(mask, image.flip((-2, -1)), image)
+        return observation
+
+    def transform_features(self, features):
+        return {
+            group: {key: value for key, value in values.items() if key != XVLA_WRIST_FLIP_KEY}
+            for group, values in features.items()
+        }
+
+
 @dataclass
 class LiberoProcessorStep(ObservationProcessorStep):
     """
@@ -475,8 +542,9 @@ class XVLARotation6DToAxisAngleProcessorStep(ProcessorStep):
 
         # Convert to numpy for processing
         device = action.device
-        dtype = action.dtype
-        action_np = action.cpu().numpy()
+        # NumPy has no bfloat16 dtype.  The environment boundary should use
+        # float32 regardless of the policy's compute dtype.
+        action_np = action.detach().float().cpu().numpy()
 
         # Extract components
         # action shape: (B, D) where D >= 10
@@ -494,7 +562,7 @@ class XVLARotation6DToAxisAngleProcessorStep(ProcessorStep):
         action_np[:, -1] = np.where(action_np[:, -1] > 0.5, 1.0, -1.0)
 
         # Convert back to tensor
-        action = torch.from_numpy(action_np).to(device=device, dtype=dtype)
+        action = torch.from_numpy(action_np).to(device=device, dtype=torch.float32)
 
         new_transition[TransitionKey.ACTION] = action
         return new_transition
@@ -521,9 +589,11 @@ def make_xvla_libero_pre_post_processors() -> tuple[
     """
     pre_processor_steps: list[ProcessorStep] = []
     post_processor_steps: list[ProcessorStep] = []
-    pre_processor_steps.extend(
-        [LiberoProcessorStep(), XVLAImageNetNormalizeProcessorStep(), XVLAAddDomainIdProcessorStep()]
-    )
+    # The official X-VLA checkpoint processor trains Florence-2 on float images
+    # in [0, 1].  Florence2VisionBackbone does not normalize internally, so the
+    # environment path must match that checkpoint contract exactly rather than
+    # injecting ImageNet normalization here.
+    pre_processor_steps.extend([LiberoProcessorStep(), XVLAAddDomainIdProcessorStep(domain_id=3)])
     post_processor_steps.extend([XVLARotation6DToAxisAngleProcessorStep()])
     return (
         PolicyProcessorPipeline[dict[str, Any], dict[str, Any]](

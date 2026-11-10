@@ -8,7 +8,7 @@ export PATH="/data/yhr/anaconda/anaconda3/envs/online_filtering/bin:$PATH"
 export LD_LIBRARY_PATH=/data/yhr/anaconda/anaconda3/lib
 export PYTHONPATH=src
 
-SOURCE=/data/zhoukai/pretrain/pi05_libero_finetuned
+SOURCE=/data/yhr/pretrain/recovered_zhoukai/pretrain/pi05_libero_finetuned
 TRAIN_ROOT=/data/yhr/output/online_filtering/ckpt/two_condition_online_flow
 OUT=${PHASE1_OUT:-$TRAIN_ROOT/phase1_no_innovation_fullmask_p025_4gpu}
 LOG=${PHASE1_LOG:-$TRAIN_ROOT/phase1_no_innovation_fullmask_p025_4gpu.log}
@@ -21,12 +21,12 @@ PROCESSES=${PHASE1_PROCESSES:-4}
 CUDA_VISIBLE_DEVICES="$GPUS" accelerate launch --multi_gpu --num_processes="$PROCESSES" \
   -m lerobot.scripts.lerobot_train \
   --dataset.repo_id=lerobot/libero \
-  --dataset.root=/data/zhoukai/dataset/libero \
+  --dataset.root=/data/yhr/pretrain/recovered_zhoukai/dataset/libero \
   --dataset.video_backend=torchcodec \
   --policy.type=online_filtering_pi05 \
   --policy.pretrained_path="$SOURCE" \
-  --policy.dinov3_model_id=/data/zhoukai/pretrain/dinov3-vits16-pretrain-lvd1689m \
-  --policy.tokenizer_name=/data/zhoukai/pretrain/paligemma-tokenizer \
+  --policy.dinov3_model_id=/data/yhr/pretrain/dinov3-vits16-pretrain-lvd1689m \
+  --policy.tokenizer_name=/data/yhr/pretrain/recovered_zhoukai/pretrain/paligemma-tokenizer \
   --policy.training_stage=online_flow \
   --policy.online_flow_phase=canonical \
   --policy.fast_spatial_tokens=true \

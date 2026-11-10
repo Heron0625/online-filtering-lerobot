@@ -22,6 +22,7 @@ from lerobot.policies.pi05.online_filtering import (
     hard_commit_action_prefix,
 )
 from lerobot.utils.constants import ACTION, OBS_LANGUAGE_ATTENTION_MASK, OBS_LANGUAGE_TOKENS, OBS_STATE
+from lerobot.utils.delay_sampling import sample_delay_distribution
 
 from .configuration_online_filtering_pi05 import OnlineFilteringPI05Config
 
@@ -43,6 +44,8 @@ def sample_online_flow_transitions(
     generator: torch.Generator | None = None,
     main_delay_probability: float = 0.5,
     medium_delay_probability: float = 0.25,
+    delay_ranges: tuple[tuple[int, int], ...] | None = None,
+    delay_probabilities: tuple[float, ...] | None = None,
 ) -> tuple[Tensor, Tensor, Tensor, Tensor]:
     """Sample one transition from the continuous-online LIBERO control/flow clock.
 
@@ -64,6 +67,8 @@ def sample_online_flow_transitions(
         generator=generator,
         main_delay_probability=main_delay_probability,
         medium_delay_probability=medium_delay_probability,
+        delay_ranges=delay_ranges,
+        delay_probabilities=delay_probabilities,
     )
     query_steps = torch.randint(num_inference_steps, (batch_size,), device=device, generator=generator)
     for row in range(batch_size):
@@ -85,8 +90,14 @@ def sample_online_total_delays(
     generator: torch.Generator | None = None,
     main_delay_probability: float = 0.5,
     medium_delay_probability: float = 0.25,
+    delay_ranges: tuple[tuple[int, int], ...] | None = None,
+    delay_probabilities: tuple[float, ...] | None = None,
 ) -> Tensor:
     """Sample valid total delays from the shared short/medium/long deployment prior."""
+    if delay_ranges is not None or delay_probabilities is not None:
+        if delay_ranges is None or delay_probabilities is None:
+            raise ValueError("both delay ranges and probabilities are required")
+        return sample_delay_distribution(valid_observations, delay_ranges, delay_probabilities, generator)
     if not 0 <= main_delay_probability <= 1:
         raise ValueError("main_delay_probability must be in [0, 1]")
     if not 0 <= medium_delay_probability <= 1 - main_delay_probability:
@@ -522,6 +533,28 @@ class OnlineFilteringPI05Policy(PI05Policy):
     def _prepare_pretrained_state_dict(self, state_dict: dict[str, Tensor]) -> dict[str, Tensor]:
         state_dict = super()._prepare_pretrained_state_dict(state_dict)
         current = self.state_dict()
+        if self.config.training_stage == "online_flow" and self.config.online_flow_phase == "ema_rollout":
+            # Recovery training must continue the learned two-condition field. Fresh
+            # initialization is appropriate for canonical training from a backbone,
+            # but would silently discard Phase A when starting Phase 2.
+            missing_online = [
+                key
+                for key in current
+                if key.startswith(
+                    (
+                        "model.fast_resampler.",
+                        "model.fast_adapters.",
+                        "online_condition_roles",
+                        "online_delay_pair_proj.",
+                    )
+                )
+                and key not in state_dict
+            ]
+            if missing_online:
+                raise ValueError(
+                    "EMA-rollout initialization requires a trained two-condition Phase-A checkpoint; "
+                    f"missing online weights: {missing_online[:5]}"
+                )
         # Older online-flow checkpoints used a third explicit ``new-old`` role.
         # The two-condition model can still initialize from them by retaining
         # only the old/new role embeddings.
@@ -819,7 +852,15 @@ class OnlineFilteringPI05Policy(PI05Policy):
 
     def _forward_stage_a(self, batch: dict[str, Tensor], reduction: str) -> tuple[Tensor, dict]:
         valid_observations = self._observation_validity(batch)
-        delays = sample_causal_delays(valid_observations)
+        delays = (
+            sample_delay_distribution(
+                valid_observations,
+                self.config.delay_sampling_ranges,
+                self.config.delay_sampling_probabilities,
+            )
+            if self.config.delay_sampling_ranges is not None
+            else sample_causal_delays(valid_observations)
+        )
         initial_batch = self._initial_slow_batch(batch)
         images, img_masks = self._preprocess_images(initial_batch)
         tokens = batch[OBS_LANGUAGE_TOKENS]
@@ -886,6 +927,8 @@ class OnlineFilteringPI05Policy(PI05Policy):
             self.config.num_inference_steps,
             main_delay_probability=self.config.main_delay_probability,
             medium_delay_probability=self.config.medium_delay_probability,
+            delay_ranges=self.config.delay_sampling_ranges,
+            delay_probabilities=self.config.delay_sampling_probabilities,
         )
         initial_batch = self._initial_slow_batch(batch)
         images, img_masks = self._preprocess_images(initial_batch)
@@ -956,6 +999,8 @@ class OnlineFilteringPI05Policy(PI05Policy):
                     valid[row : row + 1],
                     main_delay_probability=self.config.main_delay_probability,
                     medium_delay_probability=self.config.medium_delay_probability,
+                    delay_ranges=self.config.delay_sampling_ranges,
+                    delay_probabilities=self.config.delay_sampling_probabilities,
                 )[0].item()
             )
             if total == 0:
@@ -1013,18 +1058,23 @@ class OnlineFilteringPI05Policy(PI05Policy):
                     torch.zeros_like(current_time[:, None]),
                     current_time[:, None],
                 )
+                # New observations can advance the executed prefix since the previous query.
+                # Keep the persistent particle unchanged for rows whose rollout already stopped.
+                teacher_particle = hard_commit_action_prefix(particle, actions, new_delays)
+                committed = hard_commit_action_prefix(particle, actions, new_delays)
+                particle = torch.where(active[:, None, None], committed, particle)
                 velocity = teacher.model.predict_velocity(
                     teacher_images,
                     teacher_img_masks,
                     tokens,
                     masks,
-                    particle,
+                    teacher_particle,
                     model_time,
                     fast_adapters=teacher.model.fast_adapters,
                     fast_tokens=condition,
                     fast_delays=new_delays,
                 )
-                proposal = particle - velocity / self.config.num_inference_steps
+                proposal = teacher_particle - velocity / self.config.num_inference_steps
                 proposal = hard_commit_action_prefix(proposal, actions, new_delays)
                 particle = torch.where(active[:, None, None], proposal, particle)
 
@@ -1364,14 +1414,22 @@ class OnlineFilteringPI05Policy(PI05Policy):
             flow_time = torch.full((1,), 1.0 - step / num_steps, device=particle.device, dtype=torch.float32)
             previous_fast_tokens = current_fast_tokens
             previous_version = current_version
+            packet = None
             if observation_callback is not None:
-                observation_callback(step, num_steps, generation)
+                packet = observation_callback(step, num_steps, generation)
             query_timestamp = wall_time.monotonic()
-            packet = self.fast_observation_buffer.latest_ready_after(
-                current_version,
-                generation=generation,
-                query_timestamp=query_timestamp,
-            )
+            if packet is None:
+                packet = self.fast_observation_buffer.latest_ready_after(
+                    current_version,
+                    generation=generation,
+                    query_timestamp=query_timestamp,
+                )
+            elif (
+                packet.generation != generation
+                or packet.capture_step <= current_version
+                or not bool(packet.camera_valid_mask.bool().all())
+            ):
+                raise ValueError("direct observation must be valid, newer, and from the current generation")
             if packet is not None:
                 if packet.executed_prefix is None:
                     raise ValueError("online observation packet is missing executed_prefix")

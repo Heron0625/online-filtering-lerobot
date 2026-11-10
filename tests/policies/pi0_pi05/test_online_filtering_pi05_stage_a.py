@@ -66,9 +66,7 @@ def test_full_slow_visual_dropout_masks_every_patch() -> None:
         model=SimpleNamespace(
             paligemma_with_expert=SimpleNamespace(
                 paligemma=SimpleNamespace(
-                    config=SimpleNamespace(
-                        vision_config=SimpleNamespace(image_size=32, patch_size=16)
-                    )
+                    config=SimpleNamespace(vision_config=SimpleNamespace(image_size=32, patch_size=16))
                 )
             )
         ),
@@ -311,9 +309,7 @@ def test_stage_b_particle_loss_masks_prefix_and_padded_dimensions() -> None:
 
 
 def test_stage_b_switch_times_match_inference_grid_and_exclude_endpoints() -> None:
-    steps, times = sample_midflow_times(
-        256, 10, "cpu", generator=torch.Generator().manual_seed(29)
-    )
+    steps, times = sample_midflow_times(256, 10, "cpu", generator=torch.Generator().manual_seed(29))
     assert torch.all((steps >= 1) & (steps < 10))
     assert torch.all((times > 0) & (times < 1))
     assert torch.allclose(times, 1.0 - steps.float() / 10)
@@ -340,3 +336,99 @@ def test_pretrained_processor_is_reconciled_to_initial_state() -> None:
         _config(), preprocessor, postprocessor
     )
     assert reconciled.steps[0].temporal_index == 0
+
+
+def test_ema_teacher_commits_newly_executed_prefix_before_prediction() -> None:
+    actions = torch.zeros(1, 4, 2)
+    calls = []
+
+    def predict(images, image_masks, tokens, masks, particle, model_time, **kwargs):
+        delay = int(kwargs["fast_delays"][0])
+        torch.testing.assert_close(particle[:, :delay], actions[:, :delay])
+        calls.append(delay)
+        return torch.zeros_like(particle)
+
+    teacher = SimpleNamespace(
+        _preprocess_images=lambda batch: ([], []),
+        _make_fast_tokens=lambda batch, delays: torch.zeros(1, 2, 4),
+        _make_online_condition_tokens=lambda *args: torch.zeros(1, 4, 4),
+        model=SimpleNamespace(predict_velocity=predict, fast_adapters=None),
+    )
+    policy = SimpleNamespace(
+        _online_flow_teacher=teacher,
+        config=SimpleNamespace(
+            num_inference_steps=3,
+            online_flow_rollout_weight=1.0,
+            output_features={"action": SimpleNamespace(shape=(2,))},
+        ),
+        _observation_validity=lambda batch: torch.ones(1, 3, dtype=torch.bool),
+        prepare_action=lambda batch: actions,
+        _sample_rollout_schedule=lambda valid: (
+            torch.tensor([[0, 1, 2]]),
+            torch.tensor([2]),
+            torch.tensor([0]),
+        ),
+        _initial_slow_batch=lambda batch: batch,
+        _preprocess_images=teacher._preprocess_images,
+        _sample_slow_visual_masks=lambda images, batch_size: None,
+        _make_fast_tokens=teacher._make_fast_tokens,
+        _make_online_condition_tokens=teacher._make_online_condition_tokens,
+        _slow_visual_dropout_probability=lambda: 0.0,
+        model=SimpleNamespace(
+            sample_noise=lambda shape, device: torch.ones(shape, device=device),
+            predict_velocity=predict,
+            fast_adapters=None,
+        ),
+    )
+    batch = {
+        "observation.language.tokens": torch.zeros(1, 2, dtype=torch.long),
+        "observation.language.attention_mask": torch.ones(1, 2, dtype=torch.bool),
+    }
+    OnlineFilteringPI05Policy._forward_online_flow_ema_rollout(policy, batch, "mean")
+    assert calls == [0, 1, 2]
+
+
+def test_online_flow_requires_multiple_inference_queries() -> None:
+    with pytest.raises(ValueError, match="at least two inference steps"):
+        _config(num_inference_steps=1, online_flow_rollout_steps=1)
+
+
+def test_online_flow_allows_zero_delay_without_legacy_posterior_gap() -> None:
+    config = _config(max_inference_delay=0)
+    assert config.image_observation_delta_indices == [0]
+    assert config.state_observation_delta_indices == [0]
+
+
+def _small_online_checkpoint_policy(phase):
+    policy = OnlineFilteringPI05Policy.__new__(OnlineFilteringPI05Policy)
+    torch.nn.Module.__init__(policy)
+    policy.config = SimpleNamespace(training_stage="online_flow", online_flow_phase=phase)
+    policy.online_condition_roles = torch.nn.Parameter(torch.zeros(2, 1, 8))
+    policy.online_delay_pair_proj = torch.nn.Linear(3, 8)
+    policy.model = torch.nn.Module()
+    policy.model.fast_resampler = torch.nn.Linear(8, 8)
+    policy.model.fast_adapters = torch.nn.ModuleDict({"2": torch.nn.Linear(8, 8)})
+    return policy
+
+
+@pytest.mark.parametrize("missing_key", ["online_condition_roles", "model.fast_adapters.2.weight"])
+def test_ema_rollout_rejects_missing_learned_online_weights(missing_key) -> None:
+    policy = _small_online_checkpoint_policy("ema_rollout")
+    state = dict(policy.state_dict())
+    state.pop(missing_key)
+    with pytest.raises(ValueError, match="trained two-condition Phase-A checkpoint"):
+        policy._prepare_pretrained_state_dict(state)
+
+
+def test_ema_rollout_preserves_complete_online_weights() -> None:
+    policy = _small_online_checkpoint_policy("ema_rollout")
+    state = dict(policy.state_dict())
+    loaded = policy._prepare_pretrained_state_dict(state)
+    for key, value in state.items():
+        assert torch.equal(loaded[key], value)
+
+
+def test_canonical_initializes_new_online_weights_from_backbone() -> None:
+    policy = _small_online_checkpoint_policy("canonical")
+    loaded = policy._prepare_pretrained_state_dict({})
+    assert set(loaded) == set(policy.state_dict())

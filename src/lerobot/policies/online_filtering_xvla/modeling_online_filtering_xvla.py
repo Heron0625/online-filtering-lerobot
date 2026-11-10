@@ -13,6 +13,7 @@ from lerobot.policies.pi05.online_filtering import DINOv3PatchEncoder
 from lerobot.policies.pretrained import PreTrainedPolicy
 from lerobot.policies.xvla.modeling_xvla import XVLAModel, XVLAPolicy
 from lerobot.policies.xvla.soft_transformer import timestep_embedding
+from lerobot.policies.xvla.utils import libero_state_to_xvla_proprio
 from lerobot.utils.constants import ACTION, OBS_LANGUAGE_TOKENS, OBS_STATE
 from lerobot.utils.import_utils import require_package
 
@@ -132,9 +133,11 @@ class OnlineFilteringXVLAModel(XVLAModel):
         )
 
     def encode_slow_condition(
-        self, input_ids: Tensor, images: Tensor, image_mask: Tensor
+        self, input_ids: Tensor, images: Tensor, image_mask: Tensor, visual_drop_mask: Tensor | None = None
     ) -> dict[str, Tensor | int]:
-        encoded = self.forward_vlm(input_ids, images.to(self._get_target_dtype()), image_mask)
+        encoded = self.forward_vlm(
+            input_ids, images.to(self._get_target_dtype()), image_mask, visual_drop_mask=visual_drop_mask
+        )
         aux_count = encoded["aux_visual_inputs"].shape[1]
         primary_count = aux_count // max(images.shape[1] - 1, 1)
         return {**encoded, "primary_visual_tokens": primary_count}
@@ -189,9 +192,13 @@ class OnlineFilteringXVLAModel(XVLAModel):
         condition = self.make_online_condition(
             old_fast_tokens.to(dtype), new_fast_tokens.to(dtype), old_delay, new_delay
         )
+        active_adapters = self.config.fast_adapter_active_layers
+        if active_adapters is None:
+            active_adapters = self.config.fast_adapter_layers
+        active_adapters = set(active_adapters) if self.config.fast_adapters_enabled else set()
         for index, block in enumerate(tr.blocks):
             x = block(x, key_padding_mask=padding)
-            if str(index) in self.fast_adapters:
+            if index in active_adapters and str(index) in self.fast_adapters:
                 action_hidden = self.fast_adapters[str(index)](x[:, :horizon], condition, new_delay)
                 x = torch.cat((action_hidden, x[:, horizon:]), dim=1)
         return tr.action_decoder(tr.norm(x[:, :horizon]), domain_id)
@@ -329,6 +336,8 @@ class OnlineFilteringXVLAPolicy(XVLAPolicy):
         if state.ndim > 2:
             rows = torch.arange(indices.shape[0], device=indices.device)
             state = state[rows, indices]
+        if state.shape[-1] == 8:
+            state = libero_state_to_xvla_proprio(state)
         return pad_vector(state, self.model.dim_proprio, truncate=True)
 
     def _fast_pixels_at(self, batch: dict[str, Tensor], indices: Tensor) -> Tensor:
@@ -342,6 +351,11 @@ class OnlineFilteringXVLAPolicy(XVLAPolicy):
                 image = image.permute(0, 3, 1, 2)
             if was_uint8:
                 image = image / 255.0
+            # Slow Florence-2 follows the official X-VLA [0, 1] checkpoint
+            # contract.  DINO, however, needs ImageNet normalization locally;
+            # do not rely on a global environment processor that would also
+            # alter the slow stream.
+            if image.min() >= 0 and image.max() <= 1:
                 mean = image.new_tensor((0.485, 0.456, 0.406))[None, :, None, None]
                 std = image.new_tensor((0.229, 0.224, 0.225))[None, :, None, None]
                 image = (image - mean) / std
@@ -366,7 +380,7 @@ class OnlineFilteringXVLAPolicy(XVLAPolicy):
         for key in (*self.fast_image_features, OBS_STATE):
             pad = batch.get(f"{key}_is_pad")
             if pad is not None and pad.ndim == 2:
-                valid &= ~pad.bool()
+                valid &= ~pad[:, :window].bool()
         return valid
 
     def _sample_total_delays(self, valid: Tensor) -> Tensor:
@@ -396,12 +410,16 @@ class OnlineFilteringXVLAPolicy(XVLAPolicy):
         old = (query - 1).clamp_min(0) * total // (self.config.num_denoising_steps - 1)
         return old, new, 1 - query.float() / self.config.num_denoising_steps, total
 
-    def _slow_inputs(self, batch: dict[str, Tensor]) -> tuple[dict[str, Tensor | int], Tensor, Tensor]:
+    def _slow_inputs(
+        self, batch: dict[str, Tensor], *, visual_drop_mask: Tensor | None = None
+    ) -> tuple[dict[str, Tensor | int], Tensor, Tensor]:
         batch_size = batch[OBS_LANGUAGE_TOKENS].shape[0]
         zero = torch.zeros(batch_size, dtype=torch.long, device=batch[OBS_LANGUAGE_TOKENS].device)
         images, mask = self._prepare_images_at(batch, zero)
         return (
-            self.model.encode_slow_condition(batch[OBS_LANGUAGE_TOKENS], images, mask),
+            self.model.encode_slow_condition(
+                batch[OBS_LANGUAGE_TOKENS], images, mask, visual_drop_mask=visual_drop_mask
+            ),
             self._prepare_state_at(batch, zero),
             self._get_domain_id(batch, batch_size, images.device),
         )
@@ -410,19 +428,14 @@ class OnlineFilteringXVLAPolicy(XVLAPolicy):
         self, prediction: Tensor, targets: Tensor, delays: Tensor, batch: dict[str, Tensor]
     ) -> tuple[Tensor, dict[str, Tensor]]:
         valid = torch.arange(targets.shape[1], device=targets.device)[None] >= delays[:, None]
-        if "action_is_pad" in batch:
-            valid &= ~batch["action_is_pad"].to(device=valid.device, dtype=torch.bool)
-        terms: dict[str, list[Tensor]] = {}
-        for row in range(targets.shape[0]):
-            if not valid[row].any():
-                continue
-            for name, value in self.model.action_space.compute_loss(
-                prediction[row : row + 1, valid[row]], targets[row : row + 1, valid[row]]
-            ).items():
-                terms.setdefault(name, []).append(value)
-        if not terms:
+        target_pad = self._action_target_pad_mask(batch)
+        if target_pad is not None:
+            valid &= ~target_pad.to(device=valid.device, dtype=torch.bool)
+        if not valid.any():
             raise ValueError("batch contains no valid suffix actions")
-        losses = {name: torch.stack(values).mean() for name, values in terms.items()}
+        losses = self.model.action_space.compute_loss(
+            prediction[valid].unsqueeze(0), targets[valid].unsqueeze(0)
+        )
         return sum(losses.values()), losses
 
     def _predict(
@@ -436,7 +449,14 @@ class OnlineFilteringXVLAPolicy(XVLAPolicy):
         slow=None,
         drop=True,
     ) -> Tensor:
-        slow, base_state, domain = self._slow_inputs(batch) if slow is None else slow
+        if self.config.fast_current_only:
+            old = new
+        visual_drop_mask = self._sample_slow_dropout(particle.shape[0], particle.device) if drop else None
+        if visual_drop_mask is not None and visual_drop_mask.any() and slow is not None:
+            raise ValueError("visual dropout requires encoding the slow context before multimodal fusion")
+        slow, base_state, domain = (
+            self._slow_inputs(batch, visual_drop_mask=visual_drop_mask) if slow is None else slow
+        )
         return self.model.predict_endpoint(
             slow_condition=slow,
             domain_id=domain,
@@ -447,16 +467,17 @@ class OnlineFilteringXVLAPolicy(XVLAPolicy):
             new_delay=new,
             particle=particle,
             flow_time=time,
-            drop_slow_visual=self._sample_slow_dropout(particle.shape[0], particle.device) if drop else None,
+            drop_slow_visual=visual_drop_mask,
         )
 
     def _stage_a_forward(self, batch: dict[str, Tensor]) -> tuple[Tensor, dict]:
         targets = self._prepare_action_targets(batch).to(self.model._get_target_dtype())
         old, new, time, total = self._sample_schedule(self._observation_validity(batch))
         noise = torch.randn_like(targets)
-        prediction = self._predict(
-            batch, noise * time[:, None, None] + targets * (1 - time[:, None, None]), time, old, new
-        )
+        particle = noise * time[:, None, None] + targets * (1 - time[:, None, None])
+        positions = torch.arange(targets.shape[1], device=targets.device)[None]
+        particle = torch.where((positions < new[:, None])[..., None], targets, particle)
+        prediction = self._predict(batch, particle, time, old, new)
         loss, losses = self._masked_action_loss(prediction, targets, new, batch)
         metrics = {name: value.detach().item() for name, value in losses.items()}
         metrics.update(
@@ -480,8 +501,9 @@ class OnlineFilteringXVLAPolicy(XVLAPolicy):
         )
         noise = torch.randn_like(targets)
         particle = noise
-        teacher_slow = teacher._slow_inputs(batch)
+        positions = torch.arange(targets.shape[1], device=targets.device)[None]
         with torch.no_grad():
+            teacher_slow = teacher._slow_inputs(batch)
             for step in range(int(rollout.max().item())):
                 active = step < rollout
                 old = max(step - 1, 0) * total // (self.config.num_denoising_steps - 1)
@@ -492,6 +514,9 @@ class OnlineFilteringXVLAPolicy(XVLAPolicy):
                     device=targets.device,
                     dtype=targets.dtype,
                 )
+                particle = torch.where(
+                    (active[:, None] & (positions < new[:, None]))[..., None], targets, particle
+                )
                 endpoint = teacher._predict(batch, particle, time, old, new, slow=teacher_slow, drop=False)
                 next_time = 1 - (step + 1) / self.config.num_denoising_steps
                 proposal = noise * next_time + endpoint * (1 - next_time)
@@ -501,6 +526,7 @@ class OnlineFilteringXVLAPolicy(XVLAPolicy):
         old = (rollout - 1).clamp_min(0) * total // (self.config.num_denoising_steps - 1)
         new = rollout * total // (self.config.num_denoising_steps - 1)
         time = 1 - rollout.to(targets.dtype) / self.config.num_denoising_steps
+        particle = torch.where((positions < new[:, None])[..., None], targets, particle)
         prediction = self._predict(batch, particle.detach(), time, old, new)
         loss, losses = self._masked_action_loss(prediction, targets, new, batch)
         metrics = {name: value.detach().item() for name, value in losses.items()}
@@ -568,7 +594,10 @@ class OnlineFilteringXVLAPolicy(XVLAPolicy):
     def predict_action_chunk(self, batch: dict[str, Tensor], **kwargs) -> Tensor:
         callback = kwargs.pop("observation_callback", None)
         if callback is None:
-            return super().predict_action_chunk(batch, **kwargs)
+
+            def callback(*args):
+                return None
+
         generation = kwargs.pop("online_generation", None) or self.begin_online_generation()
         assimilation = kwargs.pop("assimilation_callback", None)
         kwargs.pop("observation_age_override", None)
@@ -589,8 +618,15 @@ class OnlineFilteringXVLAPolicy(XVLAPolicy):
         for query in range(steps):
             time = torch.full((1,), 1 - query / steps, device=device, dtype=dtype)
             particle = noise * time[:, None, None] + endpoint * (1 - time[:, None, None])
-            callback(query, steps, generation)
-            packet = self._take_online_packet(current_delay, generation)
+            # Controlled simulators may return the observation captured exactly at
+            # this query. Real asynchronous callers continue to use the buffer.
+            packet = callback(query, steps, generation)
+            if packet is None:
+                packet = self._take_online_packet(current_delay, generation)
+            elif not isinstance(packet, XVLAObservationPacket):
+                raise TypeError("observation callback must return an XVLA packet or None")
+            elif packet.generation != generation or packet.capture_step <= current_delay:
+                raise ValueError("direct observation packet is stale or belongs to another generation")
             old_fast, old_delay = current_fast, current_delay
             if packet is not None:
                 current_fast, domain, current_delay = packet.tokens, packet.domain_id, packet.capture_step
@@ -600,6 +636,8 @@ class OnlineFilteringXVLAPolicy(XVLAPolicy):
                 ]
                 if assimilation is not None:
                     assimilation(query, current_delay, self.config.training_stage == "stage_b")
+            if self.config.fast_current_only:
+                old_fast, old_delay = current_fast, current_delay
             positions = torch.arange(self.config.chunk_size, device=device)[None]
             if committed is not None:
                 particle = torch.where((positions < current_delay)[..., None], committed, particle)

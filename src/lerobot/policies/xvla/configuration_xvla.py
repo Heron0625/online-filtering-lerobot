@@ -148,6 +148,7 @@ class XVLAConfig(PreTrainedConfig):
 
     scheduler_warmup_steps: int = 1_000
     scheduler_decay_steps: int = 30_000
+    scheduler_scale_to_training_steps: bool = True
     scheduler_decay_lr: float = 2.5e-6
 
     def __post_init__(self) -> None:
@@ -209,11 +210,6 @@ class XVLAConfig(PreTrainedConfig):
             raise ValueError("XVLA requires at least one visual feature in the inputs.")
         if self.use_proprio and self.robot_state_feature is None:
             raise ValueError("`use_proprio=True` requires a proprioceptive state feature.")
-        if self.num_image_views is None:
-            self.num_image_views = len(self.image_features) + self.empty_cameras
-        else:
-            self.num_image_views = max(self.num_image_views, len(self.image_features) + self.empty_cameras)
-
         if self.empty_cameras > 0:
             height, width = (480, 640)
             if self.resize_imgs_with_padding is not None:
@@ -225,6 +221,16 @@ class XVLAConfig(PreTrainedConfig):
                         type=FeatureType.VISUAL,
                         shape=(3, height, width),
                     )
+
+        # ``image_features`` already includes the synthetic empty-camera keys
+        # added above (and serialized pretrained configs may contain them from
+        # the outset). Do not add ``empty_cameras`` a second time, otherwise a
+        # 2-real + 1-empty checkpoint silently becomes a four-view model.
+        required_views = len(self.image_features)
+        if self.num_image_views is None:
+            self.num_image_views = required_views
+        else:
+            self.num_image_views = max(self.num_image_views, required_views)
 
     def get_optimizer_preset(self) -> XVLAAdamWConfig:
         """Return the XVLA-specific optimizer with differential learning rates.
@@ -250,6 +256,7 @@ class XVLAConfig(PreTrainedConfig):
             decay_lr=self.scheduler_decay_lr,
             num_warmup_steps=self.scheduler_warmup_steps,
             num_decay_steps=self.scheduler_decay_steps,
+            scale_to_training_steps=self.scheduler_scale_to_training_steps,
         )
 
     @property
@@ -257,8 +264,18 @@ class XVLAConfig(PreTrainedConfig):
         return None
 
     @property
+    def state_observation_delta_indices(self) -> list[int]:
+        """EEF poses paired with each relative action in the target chunk."""
+        return list(range(self.chunk_size))
+
+    @property
     def action_delta_indices(self) -> list[int]:
         return list(range(self.chunk_size))
+
+    @property
+    def action_validity_feature(self) -> str:
+        """Optional per-action validity stored by the complete-episode converter."""
+        return "observation.xvla_action_valid"
 
     @property
     def reward_delta_indices(self) -> list[int] | None:

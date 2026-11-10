@@ -9,10 +9,10 @@ export PATH="/data/yhr/anaconda/anaconda3/envs/online_filtering/bin:$PATH"
 export LD_LIBRARY_PATH=/data/yhr/anaconda/anaconda3/lib
 export PYTHONPATH=src
 
-PI05_PRETRAINED=/data/zhoukai/pretrain/pi05_libero_finetuned
-DINOV3_PATH=/data/zhoukai/pretrain/dinov3-vits16-pretrain-lvd1689m
-TOKENIZER_PATH=/data/zhoukai/pretrain/paligemma-tokenizer
-LIBERO_ROOT=/data/zhoukai/dataset/libero
+PI05_PRETRAINED=/data/yhr/pretrain/recovered_zhoukai/pretrain/pi05_libero_finetuned
+DINOV3_PATH=/data/yhr/pretrain/dinov3-vits16-pretrain-lvd1689m
+TOKENIZER_PATH=/data/yhr/pretrain/recovered_zhoukai/pretrain/paligemma-tokenizer
+LIBERO_ROOT=/data/yhr/pretrain/recovered_zhoukai/dataset/libero
 TRAIN_ROOT=/data/yhr/output/online_filtering/ckpt/two_condition_online_flow
 OUT=$TRAIN_ROOT/phase1_canonical_2gpu
 LOG=$TRAIN_ROOT/phase1_canonical_2gpu_$(date +%Y%m%d_%H%M%S).log

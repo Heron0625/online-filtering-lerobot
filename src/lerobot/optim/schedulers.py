@@ -140,13 +140,14 @@ class CosineDecayWithWarmupSchedulerConfig(LRSchedulerConfig):
     num_decay_steps: int
     peak_lr: float
     decay_lr: float
+    scale_to_training_steps: bool = True
 
     def build(self, optimizer: Optimizer, num_training_steps: int) -> LambdaLR:
         # Auto-scale scheduler parameters if training steps are shorter than configured decay steps
         actual_warmup_steps = self.num_warmup_steps
         actual_decay_steps = self.num_decay_steps
 
-        if num_training_steps < self.num_decay_steps:
+        if self.scale_to_training_steps and num_training_steps < self.num_decay_steps:
             # Calculate scaling factor to fit the schedule into the available training steps
             scale_factor = num_training_steps / self.num_decay_steps
             actual_warmup_steps = int(self.num_warmup_steps * scale_factor)

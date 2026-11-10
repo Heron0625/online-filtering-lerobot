@@ -34,12 +34,12 @@ CUDA_VISIBLE_DEVICES="$GPUS" accelerate launch \
   "${LAUNCH_ARGS[@]}" \
   -m lerobot.scripts.lerobot_train \
   --dataset.repo_id=lerobot/libero \
-  --dataset.root=/data/zhoukai/dataset/libero \
+  --dataset.root=/data/yhr/pretrain/recovered_zhoukai/dataset/libero \
   --dataset.video_backend=torchcodec \
   --policy.type=online_filtering_pi05 \
   --policy.pretrained_path="$PHASE1" \
-  --policy.dinov3_model_id=/data/zhoukai/pretrain/dinov3-vits16-pretrain-lvd1689m \
-  --policy.tokenizer_name=/data/zhoukai/pretrain/paligemma-tokenizer \
+  --policy.dinov3_model_id=/data/yhr/pretrain/dinov3-vits16-pretrain-lvd1689m \
+  --policy.tokenizer_name=/data/yhr/pretrain/recovered_zhoukai/pretrain/paligemma-tokenizer \
   --policy.training_stage=online_flow \
   --policy.online_flow_phase=ema_rollout \
   --policy.online_flow_ema_decay=0.999 \
@@ -48,7 +48,10 @@ CUDA_VISIBLE_DEVICES="$GPUS" accelerate launch \
   --policy.online_flow_rollout_weight=1.0 \
   --policy.fast_spatial_tokens=true \
   --policy.fast_num_tokens=64 \
-  --policy.slow_visual_dropout_probability=0.0 \
+  --policy.slow_visual_dropout_probability=0.25 \
+  --policy.slow_visual_dropout_final_probability=0.0 \
+  --policy.slow_visual_dropout_anneal_start_step=6000 \
+  --policy.slow_visual_dropout_anneal_steps=18000 \
   --policy.slow_visual_dropout_min=0.5 \
   --policy.slow_visual_dropout_max=0.75 \
   --policy.max_inference_delay=25 \

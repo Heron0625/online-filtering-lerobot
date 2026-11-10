@@ -85,6 +85,8 @@ def resolve_delta_timestamps(
             indices = cfg.observation_delta_indices if policy_key.startswith(OBS_PREFIX) else None
         if indices is not None:
             delta_timestamps[key] = [i / ds_meta.fps for i in indices]
+        if policy_key == getattr(cfg, "action_validity_feature", None):
+            delta_timestamps[key] = [i / ds_meta.fps for i in cfg.action_delta_indices]
 
     # A policy asking for an image history that no dataset key can supply would train
     # on single frames without any error, so fail instead of degrading silently.

@@ -19,6 +19,9 @@ class OnlineFilteringXVLAConfig(XVLAConfig):
     fast_num_tokens: int = 64
     fast_num_heads: int = 8
     fast_adapter_layers: tuple[int, ...] = (3, 7, 11, 15, 19, 23)
+    fast_adapter_active_layers: tuple[int, ...] | None = None
+    fast_adapters_enabled: bool = True
+    fast_current_only: bool = False
     slow_visual_dropout_probability: float = 0.0
     slow_visual_dropout_final_probability: float = 0.25
     slow_visual_dropout_anneal_start_step: int = 500
@@ -51,6 +54,10 @@ class OnlineFilteringXVLAConfig(XVLAConfig):
             raise ValueError("fast_adapter_layers must contain valid transformer layers")
         if max(self.fast_adapter_layers) >= self.depth:
             raise ValueError("fast_adapter_layers exceed the X-VLA transformer depth")
+        if self.fast_adapter_active_layers is not None and not set(self.fast_adapter_active_layers).issubset(
+            self.fast_adapter_layers
+        ):
+            raise ValueError("fast_adapter_active_layers must be a subset of fast_adapter_layers")
         if not 0 <= self.slow_visual_dropout_probability <= 1:
             raise ValueError("slow_visual_dropout_probability must be in [0, 1]")
         if not 0 <= self.slow_visual_dropout_final_probability <= 1:
@@ -68,4 +75,4 @@ class OnlineFilteringXVLAConfig(XVLAConfig):
 
     @property
     def state_observation_delta_indices(self) -> list[int]:
-        return list(range(self.max_inference_delay + 1))
+        return list(range(max(self.max_inference_delay + 1, self.chunk_size)))

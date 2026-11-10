@@ -30,6 +30,12 @@ from lerobot.policies.online_filtering_pi05.modeling_online_filtering_pi05 impor
 from lerobot.policies.online_filtering_xvla.modeling_online_filtering_xvla import (
     OnlineFilteringXVLAPolicy,
 )
+from lerobot.policies.xvla.utils import (
+    accumulate_xvla_delta,
+    libero_delta_command_goal,
+    xvla_chunk_to_libero_delta,
+    xvla_target_to_libero_delta,
+)
 from lerobot.processor.normalize_processor import NormalizerProcessorStep
 from lerobot.utils.constants import ACTION, OBS_LANGUAGE_ATTENTION_MASK, OBS_LANGUAGE_TOKENS
 from lerobot.utils.io_utils import write_video
@@ -121,8 +127,52 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help="Optional LIBERO horizon override; the official XVLA protocol uses 800.",
     )
+    parser.add_argument(
+        "--xvla-observation-delivery", "--online-observation-delivery",
+        choices=["buffered", "direct"],
+        default="buffered",
+        help="Direct mode encodes only the current simulator observation at each denoising query",
+    )
     parser.add_argument("--seed", type=int, default=1000)
+    parser.add_argument("--diagnostic-paired-seed", action="store_true")
+    parser.add_argument(
+        "--xvla-fast-ablation", choices=["normal", "stale_all", "no_adapters"], default="normal"
+    )
+    parser.add_argument(
+        "--xvla-chunk-delta",
+        action="store_true",
+        help="Experimental target-to-target differencing with relative OSC execution",
+    )
+    parser.add_argument(
+        "--xvla-relative-execution",
+        action="store_true",
+        help="Convert each absolute target relative to the measured pose at execution time",
+    )
+    parser.add_argument(
+        "--xvla-precomputed-deltas",
+        action="store_true",
+        help="Compute the whole target-difference chunk once; never re-solve commands using live state",
+    )
+    parser.add_argument(
+        "--xvla-delta-execution",
+        choices=["current_pose", "accumulated"],
+        default="current_pose",
+        help="For precomputed deltas: current-pose OSC or a persistent target initialized once per installed chunk",
+    )
+    parser.add_argument(
+        "--resume-episodes",
+        action="store_true",
+        help="Reuse validated saved episode prefixes with paired seeds and advance reset indices",
+    )
+    parser.add_argument("--task-output-subdirs", action="store_true")
+    parser.add_argument("--record-action-trace", action="store_true")
+    parser.add_argument(
+        "--no-video",
+        action="store_true",
+        help="Skip diagnostic video rendering/encoding without changing observations or simulation steps",
+    )
     parser.add_argument("--device", default="cuda")
+    parser.add_argument("--disable-compile", action="store_true", help="Use eager inference for matched multi-worker evaluation")
     parser.add_argument(
         "--disable-online-fast",
         action="store_true",
@@ -219,7 +269,7 @@ def annotate_frame(frame: np.ndarray, line_one: str, line_two: str) -> np.ndarra
 
 def record_annotated_frame(
     env,
-    frames: list[np.ndarray],
+    frames: list[np.ndarray] | None,
     *,
     step: int,
     active_chunk_executed: int,
@@ -227,6 +277,8 @@ def record_annotated_frame(
     new_chunk_status: str,
 ) -> None:
     """Render and append one frame with explicit timeline state."""
+    if frames is None:
+        return
     rendered = np.asarray(env.call("render")[0])
     line_one = f"OLD chunk: ran={active_chunk_executed:02d} left={queue_remaining:02d} | step={step:03d}"
     frames.append(annotate_frame(rendered, line_one, new_chunk_status))
@@ -251,7 +303,10 @@ def run_episode(
     output_dir,
 ):
     """Run one episode using an already-loaded policy and save its annotated video."""
+    episode_wall_start = time.perf_counter()
     policy.reset()
+    if args.diagnostic_paired_seed:
+        set_seed(args.seed + task_id * 10000 + episode)
     preprocessor.reset()
     postprocessor.reset()
     raw, _ = env.reset(seed=[args.seed + episode], options={NEW_ROLLOUT_OPTION: True})
@@ -266,8 +321,16 @@ def run_episode(
                     obs[key] = torch.flip(value, dims=[2, 3])
         return preprocessor(obs)
 
-    def postprocess_chunk(chunk):
-        return postprocessor(chunk).squeeze(0).cpu()
+    def measured_pose(batch):
+        return policy._prepare_state(batch, 1, torch.device(policy.config.device))[0]
+
+    def postprocess_chunk(chunk, anchor_batch):
+        targets = postprocessor(chunk).squeeze(0).cpu()
+        if args.xvla_precomputed_deltas:
+            # This is evaluated ONCE, at chunk creation; only command zero
+            # references the measured trigger-time pose.
+            return xvla_chunk_to_libero_delta(targets, measured_pose(anchor_batch).cpu())
+        return targets
 
     action_normalizer = next(
         (step for step in preprocessor.steps if isinstance(step, NormalizerProcessorStep)), None
@@ -281,17 +344,73 @@ def run_episode(
     last_sent_model_action = None
     last_environment_action = None
     queue_underruns = 0
+    delta_clipped_commands = 0
+    previous_delta_goal = None
+    integrated_goal = None
+    action_trace = []
 
     def step_env(action):
         nonlocal last_sent_model_action, last_environment_action
+        nonlocal previous_delta_goal, delta_clipped_commands, integrated_goal
         last_environment_action = action.clone()
-        transition = env_postprocessor({ACTION: action.unsqueeze(0)})
+        base_reset = False
+        target_base_before = None
+        if args.xvla_precomputed_deltas:
+            command = action.clone()
+            delta_clipped_commands += int((command[:6].abs() > 1).any())
+            if args.xvla_delta_execution == "accumulated":
+                if integrated_goal is None:
+                    # Only the first ACTUALLY EXECUTED command initializes this
+                    # chunk's reference. Never replay the skipped predicted prefix.
+                    integrated_goal = measured_pose(processed).to(command).clone()
+                    base_reset = True
+                target_base_before = integrated_goal.clone()
+                integrated_goal = accumulate_xvla_delta(command, integrated_goal)
+                previous_delta_goal = integrated_goal
+                transition = env_postprocessor({ACTION: integrated_goal[None]})
+            else:
+                transition = {ACTION: command.clamp(-1, 1).unsqueeze(0)}
+                if isinstance(policy, OnlineFilteringXVLAPolicy):
+                    previous_delta_goal = libero_delta_command_goal(
+                        command, measured_pose(processed), previous_delta_goal
+                    )
+        elif args.xvla_relative_execution:
+            measured = measured_pose(processed)
+            command = xvla_target_to_libero_delta(action.to(measured), measured, previous_delta_goal)
+            delta_clipped_commands += int((command[:6].abs() > 1).any())
+            previous_delta_goal = libero_delta_command_goal(command, measured, previous_delta_goal)
+            transition = {ACTION: command.clamp(-1, 1).unsqueeze(0)}
+        else:
+            transition = env_postprocessor({ACTION: action.unsqueeze(0)})
+        if args.record_action_trace:
+            action_trace.append(
+                {
+                    "step": len(action_trace),
+                    "chunk_row_index": active_chunk_executed,
+                    "base_reset": base_reset,
+                    "target_base_before": target_base_before.tolist()
+                    if target_base_before is not None
+                    else None,
+                    "accumulated_target": integrated_goal.tolist()
+                    if args.xvla_precomputed_deltas and args.xvla_delta_execution == "accumulated"
+                    else None,
+                    "queued_action": action.detach().float().cpu().tolist(),
+                    "sent_command": transition[ACTION][0].detach().float().cpu().tolist(),
+                    "execution_mode": ("precomputed_" + args.xvla_delta_execution)
+                    if args.xvla_precomputed_deltas
+                    else ("measured_target" if args.xvla_relative_execution else "native"),
+                }
+            )
         if isinstance(policy, OnlineFilteringPI05Policy):
             sent = transition[ACTION].to(device=policy.config.device)
             last_sent_model_action = normalize_executed_command(action_normalizer, sent)
         elif isinstance(policy, OnlineFilteringXVLAPolicy):
             index = min(active_chunk_executed, active_model_chunk.shape[1] - 1)
-            last_sent_model_action = active_model_chunk[:, index].to(policy.config.device)
+            last_sent_model_action = (
+                previous_delta_goal[None]
+                if args.xvla_relative_execution or args.xvla_precomputed_deltas
+                else active_model_chunk[:, index]
+            ).to(policy.config.device)
         return env.step(transition[ACTION].cpu().numpy())
 
     def pop_action_or_safe_hold(action_queue):
@@ -303,7 +422,11 @@ def run_episode(
         if last_environment_action is None:
             raise RuntimeError("cannot synthesize a safe hold before the first action")
         queue_underruns += 1
-        if env_cfg.control_mode == "absolute":
+        if args.xvla_precomputed_deltas:
+            hold = torch.zeros_like(last_environment_action)
+            hold[-1] = last_environment_action[-1]
+            return hold
+        if env_cfg.control_mode == "absolute" or args.xvla_relative_execution:
             # Absolute actions encode a target pose, so repeating the latest target
             # holds position. Sending zeros would instead command an unrelated pose.
             return last_environment_action.clone()
@@ -325,10 +448,12 @@ def run_episode(
         return chunk[..., :action_dim]
 
     def predict_regular(batch):
+        if isinstance(policy, OnlineFilteringXVLAPolicy):
+            # The initial chunk has no pending control steps, but must still use
+            # the trained fast adapters with the synchronous delay-zero packet.
+            return policy.predict_action_chunk(batch, observation_callback=lambda *args: None)
         if isinstance(policy, ONLINE_POLICY_TYPES):
-            return policy.predict_action_chunk(
-                batch, observation_age_override=args.observation_age_seconds
-            )
+            return policy.predict_action_chunk(batch, observation_age_override=args.observation_age_seconds)
         return policy.predict_action_chunk(batch)
 
     processed = process(raw)
@@ -338,7 +463,7 @@ def run_episode(
             if args.disable_online_fast and isinstance(policy, OnlineFilteringPI05Policy)
             else predict_regular(processed)
         )
-        initial_environment_chunk = postprocess_chunk(active_model_chunk)
+        initial_environment_chunk = postprocess_chunk(active_model_chunk, processed)
         queue = deque(initial_environment_chunk.unbind(0))
     action_diagnostics = {
         "model_shape": list(active_model_chunk.shape),
@@ -357,7 +482,7 @@ def run_episode(
     steps = 0
     inference_seconds = []
     simulated_pipeline_seconds = []
-    frames = []
+    frames = None if args.no_video else []
     events = []
     sampled_delays = []
     sampled_switch_steps = []
@@ -383,9 +508,7 @@ def run_episode(
         if countdown == 0:
             delay_seed = args.seed if args.delay_seed is None else args.delay_seed
             delay_sequence = (
-                [int(item) for item in args.delay_sequence.split(",")]
-                if args.delay_sequence
-                else None
+                [int(item) for item in args.delay_sequence.split(",")] if args.delay_sequence else None
             )
             delay = (
                 delay_sequence[min(chunk_index, len(delay_sequence) - 1)]
@@ -413,6 +536,7 @@ def run_episode(
             callback_seconds = 0.0
             encoding_seconds = 0.0
             chunk_assimilations = []
+            last_direct_capture = 0
 
             def advance_pending(
                 target_elapsed,
@@ -427,11 +551,9 @@ def run_episode(
             ):
                 nonlocal raw, steps, active_chunk_executed, total_reward, succeeded
                 nonlocal processed, pending_elapsed, episode_finished
-                nonlocal encoding_seconds
+                nonlocal encoding_seconds, last_direct_capture
                 while pending_elapsed < target_elapsed and not episode_finished:
-                    raw, reward, terminated, truncated, info = step_env(
-                        pop_action_or_safe_hold(queue)
-                    )
+                    raw, reward, terminated, truncated, info = step_env(pop_action_or_safe_hold(queue))
                     if isinstance(policy, ONLINE_POLICY_TYPES):
                         executed_model_actions.append(last_sent_model_action.clone())
                     steps += 1
@@ -445,6 +567,10 @@ def run_episode(
                     processed = process(raw)
                     capture = (
                         generation is not None
+                        and not (
+                            isinstance(policy, ONLINE_POLICY_TYPES)
+                            and args.xvla_observation_delivery == "direct"
+                        )
                         and not episode_finished
                         and (
                             pending_elapsed % args.online_observation_interval == 0
@@ -455,8 +581,9 @@ def run_episode(
                         if torch.cuda.is_available():
                             torch.cuda.synchronize()
                         encoding_start = time.perf_counter()
+                        packet_batch = initial if args.xvla_fast_ablation == "stale_all" else processed
                         packet = policy.encode_fast_observation_packet(
-                            processed,
+                            packet_batch,
                             initial_batch=initial,
                             capture_step=pending_elapsed,
                             capture_timestamp=time.monotonic(),
@@ -466,7 +593,8 @@ def run_episode(
                         # Synthetic delay is measured by executed control steps. Do not let
                         # GPU contention between parallel eval workers turn synchronous
                         # observations into wall-clock-stale packets or alter the age gate.
-                        packet = replace(packet, capture_timestamp=packet.ready_timestamp)
+                        if isinstance(policy, OnlineFilteringPI05Policy):
+                            packet = replace(packet, capture_timestamp=packet.ready_timestamp)
                         policy.push_fast_observation(packet)
                         if torch.cuda.is_available():
                             torch.cuda.synchronize()
@@ -488,7 +616,45 @@ def run_episode(
                         new_chunk_status=f"NEW chunk: DENOISING k={flow_step} | elapsed={pending_elapsed}/{delay} obs={'READY' if capture else 'WAIT'}",
                     )
 
-            def observation_callback(flow_step, num_steps, generation, delay=delay):
+                if (
+                    isinstance(policy, ONLINE_POLICY_TYPES)
+                    and args.xvla_observation_delivery == "direct"
+                    and not episode_finished
+                    and pending_elapsed > last_direct_capture
+                ):
+                    encoding_start = time.perf_counter()
+                    packet_batch = initial if args.xvla_fast_ablation == "stale_all" else processed
+                    packet = policy.encode_fast_observation_packet(
+                        packet_batch,
+                        initial_batch=initial,
+                        capture_step=pending_elapsed,
+                        capture_timestamp=time.monotonic(),
+                        generation=generation,
+                        executed_prefix=torch.stack(executed_model_actions, dim=1),
+                    )
+                    if torch.cuda.is_available():
+                        torch.cuda.synchronize()
+                    encoding_seconds += time.perf_counter() - encoding_start
+                    last_direct_capture = pending_elapsed
+                    events.append(
+                        {
+                            "type": "online_observation",
+                            "step": steps,
+                            "capture_step": pending_elapsed,
+                            "flow_step": flow_step,
+                        }
+                    )
+                    return packet
+                return None
+
+            def observation_callback(
+                flow_step,
+                num_steps,
+                generation,
+                delay=delay,
+                initial=initial,
+                executed_model_actions=executed_model_actions,
+            ):
                 # A deterministic control/flow clock: advance the simulator while the
                 # old chunk executes, before each denoising query. Never advance to
                 # t+delay before starting the old-condition flow.
@@ -496,8 +662,9 @@ def run_episode(
                 if torch.cuda.is_available():
                     torch.cuda.synchronize()
                 callback_start = time.perf_counter()
-                advance_pending(flow_step * delay // (num_steps - 1), flow_step, generation)
+                packet = advance_pending(flow_step * delay // (num_steps - 1), flow_step, generation)
                 callback_seconds += time.perf_counter() - callback_start
+                return packet
 
             def assimilation_callback(
                 flow_step,
@@ -570,7 +737,8 @@ def run_episode(
                         f"expected={expected_capture_steps}, actual={actual_capture_steps}, delay={delay}"
                     )
             active_model_chunk = chunk
-            queue = deque(postprocess_chunk(chunk)[delay:].unbind(0))
+            queue = deque(postprocess_chunk(chunk, initial)[delay:].unbind(0))
+            integrated_goal = None
             active_chunk_executed = delay
             events.append(
                 {
@@ -579,9 +747,9 @@ def run_episode(
                     "observation_step": observation_step,
                     "delay": delay,
                     "new_chunk_start_index": delay,
-                    "online_assimilations": sum(
-                        e["type"] == "online_assimilation" and e["step"] >= observation_step for e in events
-                    ),
+                    # Use this generation's trace; the previous generation may
+                    # also assimilate at observation_step (the shared boundary).
+                    "online_assimilations": len(chunk_assimilations),
                     "inference_switch_step": switch_step
                     if isinstance(policy, ONLINE_POLICY_TYPES)
                     and policy.config.training_stage in {"stage_b", "online_flow"}
@@ -621,10 +789,13 @@ def run_episode(
             break
     output_dir.mkdir(parents=True, exist_ok=True)
     status = "success" if succeeded else "failure"
-    video_path = output_dir / f"episode_{episode:03d}_{status}_annotated.mp4"
-    write_video(video_path, frames, fps=env_cfg.fps)
+    video_path = None
+    if frames is not None:
+        video_path = output_dir / f"episode_{episode:03d}_{status}_annotated.mp4"
+        write_video(video_path, frames, fps=env_cfg.fps)
     return {
         "episode": episode,
+        "wall_time_s": time.perf_counter() - episode_wall_start,
         "seed": args.seed + episode,
         "delay": None if dynamic_delay else delay,
         "delays": sampled_delays,
@@ -636,11 +807,26 @@ def run_episode(
         "mean_simulated_pipeline_s": float(np.mean(simulated_pipeline_seconds))
         if simulated_pipeline_seconds
         else 0.0,
-        "video_path": str(video_path),
+        "video_path": str(video_path) if video_path is not None else None,
+        "cuda_peak_allocated_mib": torch.cuda.max_memory_allocated() / 2**20
+        if torch.cuda.is_available()
+        else None,
+        "cuda_peak_reserved_mib": torch.cuda.max_memory_reserved() / 2**20
+        if torch.cuda.is_available()
+        else None,
         "events": events,
+        "xvla_observation_delivery": args.xvla_observation_delivery,
+        "xvla_chunk_delta": args.xvla_chunk_delta,
+        "xvla_relative_execution": args.xvla_relative_execution,
+        "xvla_precomputed_deltas": args.xvla_precomputed_deltas,
+        "xvla_delta_execution": args.xvla_delta_execution,
+        "xvla_fast_ablation": args.xvla_fast_ablation,
+        "diagnostic_paired_seed": args.diagnostic_paired_seed,
         "evaluation_protocol": "continuous_online_v1",
         "online_assimilations": sum(e["type"] == "online_assimilation" for e in events),
         "queue_underruns": queue_underruns,
+        "delta_clipped_commands": delta_clipped_commands,
+        "action_trace": action_trace if args.record_action_trace else None,
         "initial_action_diagnostics": action_diagnostics,
         "smoke_test_capped": max_steps < environment_max_steps,
     }
@@ -649,6 +835,17 @@ def run_episode(
 def main() -> None:
     """Run one or many LIBERO suites while loading the policy only once."""
     args = parse_args()
+    if args.resume_episodes and not args.diagnostic_paired_seed:
+        raise ValueError("episode resume requires independent paired per-episode seeds")
+    if args.xvla_delta_execution == "accumulated" and not args.xvla_precomputed_deltas:
+        raise ValueError("accumulated target execution requires --xvla-precomputed-deltas")
+    if args.xvla_precomputed_deltas and args.xvla_relative_execution:
+        raise ValueError("choose precomputed chunk deltas OR measured-target execution, never both")
+    if args.xvla_chunk_delta:
+        raise ValueError(
+            "--xvla-chunk-delta is retired: consecutive OSC goals are not measured poses. "
+            "Choose --xvla-precomputed-deltas for fixed chunk deltas, or --xvla-relative-execution for measured-target tracking."
+        )
     assets_path = Path(os.environ.get("LIBERO_ASSETS_PATH", "/data/zhoukai/dataset/libero-assets"))
     if (assets_path / "scenes/libero_tabletop_base_style.xml").is_file():
         import libero.libero as libero_resources
@@ -682,12 +879,12 @@ def main() -> None:
     policy_cfg = PreTrainedConfig.from_pretrained(policy_path)
     policy_cfg.pretrained_path = policy_path
     policy_cfg.device = args.device
+    if args.disable_compile and hasattr(policy_cfg, "compile_model"):
+        policy_cfg.compile_model = False
     policy_cfg.n_action_steps = policy_cfg.chunk_size
     baseline_root = Path("/data/yhr/pretrain/online_filtering_baselines")
     if policy_cfg.type == "pi0_fast":
-        text_tokenizer = Path(
-            "/data/yhr/pretrain/recovered_zhoukai/pretrain/paligemma-tokenizer"
-        )
+        text_tokenizer = Path("/data/yhr/pretrain/recovered_zhoukai/pretrain/paligemma-tokenizer")
         action_tokenizer = baseline_root / "fast-action-tokenizer"
         if (text_tokenizer / "tokenizer.json").is_file():
             policy_cfg.text_tokenizer_name = str(text_tokenizer)
@@ -715,7 +912,27 @@ def main() -> None:
         raise ValueError("old chunk cannot cover replan-interval + delay-max")
     switch_rng = random.Random(args.seed + 1 if args.switch_seed is None else args.switch_seed)
     xvla_policy = policy_cfg.type in {"xvla", "online_filtering_xvla"}
-    control_mode = args.control_mode or ("absolute" if xvla_policy else "relative")
+    if (args.xvla_relative_execution or args.xvla_precomputed_deltas) and not xvla_policy:
+        raise ValueError("relative target execution requires an XVLA backbone")
+    accumulated = args.xvla_precomputed_deltas and args.xvla_delta_execution == "accumulated"
+    if accumulated:
+        if args.control_mode == "relative":
+            raise ValueError("accumulated targets must use absolute OSC as the low-level tracker")
+        control_mode = "absolute"
+    else:
+        if (args.xvla_relative_execution or args.xvla_precomputed_deltas) and args.control_mode == "absolute":
+            raise ValueError("current-pose relative execution requires relative OSC")
+        control_mode = (
+            "relative"
+            if args.xvla_relative_execution or args.xvla_precomputed_deltas
+            else (args.control_mode or ("absolute" if xvla_policy else "relative"))
+        )
+    if (
+        xvla_policy
+        and control_mode == "relative"
+        and not (args.xvla_relative_execution or args.xvla_precomputed_deltas)
+    ):
+        raise ValueError("XVLA relative execution requires an explicit conversion mode")
     episode_length = args.episode_length or (800 if xvla_policy else None)
     # Build the policy once. All LIBERO suites use the same feature contract.
     policy_env_cfg = LiberoEnv(
@@ -728,13 +945,27 @@ def main() -> None:
     )
     policy = make_policy(cfg=policy_cfg, env_cfg=policy_env_cfg)
     policy.eval()
+    if args.xvla_observation_delivery == "direct" and not isinstance(policy, ONLINE_POLICY_TYPES):
+        raise ValueError("direct simulator observations require an online policy")
+    if args.xvla_observation_delivery == "direct" and args.online_observation_interval != 1:
+        raise ValueError("direct simulator observations require online-observation-interval=1")
+    if args.xvla_fast_ablation != "normal" and not isinstance(policy, OnlineFilteringXVLAPolicy):
+        raise ValueError("XVLA fast ablations require an online XVLA policy")
+    if args.xvla_fast_ablation == "no_adapters":
+        with torch.no_grad():
+            for adapter in policy.model.fast_adapters.values():
+                adapter.output_proj.weight.zero_()
+                adapter.output_proj.bias.zero_()
     if isinstance(policy, OnlineFilteringPI05Policy) and policy.config.training_stage != "online_flow":
         raise ValueError(
             "continuous two-condition evaluation requires training_stage='online_flow'; "
             f"checkpoint has {policy.config.training_stage!r}"
         )
-    if isinstance(policy, OnlineFilteringXVLAPolicy) and policy.config.training_stage != "stage_b":
-        raise ValueError("continuous X-VLA evaluation requires training_stage='stage_b'")
+    if isinstance(policy, OnlineFilteringXVLAPolicy) and policy.config.training_stage not in {
+        "stage_a",
+        "stage_b",
+    }:
+        raise ValueError("continuous X-VLA evaluation requires Stage A or Stage B weights")
     preprocessor_overrides = {"device_processor": {"device": args.device}}
     if isinstance(policy, OnlineFilteringPI05Policy):
         preprocessor_overrides["tokenizer_processor"] = {
@@ -750,13 +981,9 @@ def main() -> None:
     elif policy_cfg.type in {"xvla", "online_filtering_xvla"}:
         bart_tokenizer = baseline_root / "bart-large-tokenizer"
         if (bart_tokenizer / "tokenizer.json").is_file():
-            preprocessor_overrides["tokenizer_processor"] = {
-                "tokenizer_name": str(bart_tokenizer)
-            }
+            preprocessor_overrides["tokenizer_processor"] = {"tokenizer_name": str(bart_tokenizer)}
     elif policy_cfg.type == "pi0_fast":
-        preprocessor_overrides["tokenizer_processor"] = {
-            "tokenizer_name": policy_cfg.text_tokenizer_name
-        }
+        preprocessor_overrides["tokenizer_processor"] = {"tokenizer_name": policy_cfg.text_tokenizer_name}
         preprocessor_overrides["action_tokenizer_processor"] = {
             "action_tokenizer_name": policy_cfg.action_tokenizer_name,
             "paligemma_tokenizer_name": policy_cfg.text_tokenizer_name,
@@ -767,7 +994,7 @@ def main() -> None:
         preprocessor_overrides=preprocessor_overrides,
     )
     output_root = args.output_dir
-    multi = args.all_tasks or len(suites) > 1 or len(requested_task_ids) > 1
+    multi = args.all_tasks or len(suites) > 1 or len(requested_task_ids) > 1 or args.task_output_subdirs
     all_results = []
     try:
         for suite in suites:
@@ -786,7 +1013,34 @@ def main() -> None:
                 for task_id, env in task_map.items():
                     task_output_dir = output_root / suite / f"task_{task_id}" if multi else output_root
                     results = []
+                    progress_file = task_output_dir / "episode_progress.json"
+                    if args.resume_episodes and progress_file.exists():
+                        saved = json.loads(progress_file.read_text())
+                        assert saved["policy_path"] == str(policy_path)
+                        assert saved["suite"] == suite and saved["task_id"] == task_id
+                        assert saved["replan_interval"] == args.replan_interval
+                        assert saved["delay_range"] == [delay_min, delay_max]
+                        results = saved["episodes"]
+                        assert [e["episode"] for e in results] == list(
+                            range(args.episode_start, args.episode_start + len(results))
+                        )
+                        assert len(results) <= args.episodes
+                        for e in results:
+                            assert not e["smoke_test_capped"]
+                            assert e["xvla_precomputed_deltas"] == args.xvla_precomputed_deltas
+                            assert e["xvla_delta_execution"] == args.xvla_delta_execution
+                            assert e["xvla_relative_execution"] == args.xvla_relative_execution
+                            assert e["diagnostic_paired_seed"]
+                    resume_count = len(results)
                     for episode in range(args.episode_start, args.episode_start + args.episodes):
+                        if episode < args.episode_start + resume_count:
+                            # LIBERO owns a per-task init-state counter. Advance it
+                            # for each reused episode, without replaying its actions.
+                            env.reset(seed=[args.seed + episode], options={NEW_ROLLOUT_OPTION: True})
+                            print(
+                                f"REUSED_EPISODE suite={suite} task={task_id} episode={episode}", flush=True
+                            )
+                            continue
                         try:
                             result = run_episode(
                                 args,
@@ -836,6 +1090,13 @@ def main() -> None:
                                 "mean_simulated_pipeline_s": None,
                                 "video_path": None,
                                 "events": [],
+                                "xvla_observation_delivery": args.xvla_observation_delivery,
+                                "xvla_chunk_delta": args.xvla_chunk_delta,
+                                "xvla_relative_execution": args.xvla_relative_execution,
+                                "xvla_precomputed_deltas": args.xvla_precomputed_deltas,
+                                "xvla_delta_execution": args.xvla_delta_execution,
+                                "xvla_fast_ablation": args.xvla_fast_ablation,
+                                "diagnostic_paired_seed": args.diagnostic_paired_seed,
                                 "evaluation_protocol": "continuous_online_v1",
                                 "online_assimilations": 0,
                                 "queue_underruns": 0,
@@ -843,6 +1104,38 @@ def main() -> None:
                                 "smoke_test_capped": False,
                             }
                         results.append(result)
+                        # Status only: completed task summaries remain the authoritative
+                        # resumable unit, avoiding accidental init-state shifts on resume.
+                        task_output_dir.mkdir(parents=True, exist_ok=True)
+                        progress_path = task_output_dir / "episode_progress.json"
+                        temporary = progress_path.with_suffix(".tmp")
+                        temporary.write_text(
+                            json.dumps(
+                                {
+                                    "policy_path": str(policy_path),
+                                    "suite": suite,
+                                    "task_id": task_id,
+                                    "replan_interval": args.replan_interval,
+                                    "delay_range": [delay_min, delay_max],
+                                    "episodes": results,
+                                }
+                            )
+                        )
+                        temporary.replace(progress_path)
+                        print(
+                            "EPISODE "
+                            + json.dumps(
+                                {
+                                    "suite": suite,
+                                    "task_id": task_id,
+                                    "episode": episode,
+                                    "success": result["success"],
+                                    "steps": result["steps"],
+                                    "wall_time_s": result.get("wall_time_s"),
+                                }
+                            ),
+                            flush=True,
+                        )
                     summary = {
                         "policy_path": str(policy_path),
                         "policy_type": policy_cfg.type,
@@ -853,6 +1146,13 @@ def main() -> None:
                         "suite": suite,
                         "task_id": task_id,
                         "episodes_per_task": args.episodes,
+                        "xvla_observation_delivery": args.xvla_observation_delivery,
+                        "xvla_chunk_delta": args.xvla_chunk_delta,
+                        "xvla_relative_execution": args.xvla_relative_execution,
+                        "xvla_precomputed_deltas": args.xvla_precomputed_deltas,
+                        "xvla_delta_execution": args.xvla_delta_execution,
+                        "xvla_fast_ablation": args.xvla_fast_ablation,
+                        "diagnostic_paired_seed": args.diagnostic_paired_seed,
                         "evaluation_protocol": "continuous_online_v1",
                         "online_observation_interval": args.online_observation_interval,
                         "delay_range": [delay_min, delay_max],
@@ -884,6 +1184,13 @@ def main() -> None:
                 and policy.config.training_stage in {"stage_b", "online_flow"}
             ),
             "episodes_per_task": args.episodes,
+            "xvla_observation_delivery": args.xvla_observation_delivery,
+            "xvla_chunk_delta": args.xvla_chunk_delta,
+            "xvla_relative_execution": args.xvla_relative_execution,
+            "xvla_precomputed_deltas": args.xvla_precomputed_deltas,
+            "xvla_delta_execution": args.xvla_delta_execution,
+            "xvla_fast_ablation": args.xvla_fast_ablation,
+            "diagnostic_paired_seed": args.diagnostic_paired_seed,
             "evaluation_protocol": "continuous_online_v1",
             "online_observation_interval": args.online_observation_interval,
             "delay_range": [delay_min, delay_max],

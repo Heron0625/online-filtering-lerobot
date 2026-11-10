@@ -1,0 +1,21 @@
+method,delay_steps,success_rate_percent,episodes
+PI0.5 baseline (R25),0,93.5,400
+PI0.5 baseline (R25),5,88.5,400
+PI0.5 baseline (R25),10,83.0,400
+PI0.5 baseline (R25),15,75.75,400
+PI0.5 baseline (R25),20,70.5,400
+PI0.5 + Online Filtering (R25),0,94.25,400
+PI0.5 + Online Filtering (R25),5,90.0,400
+PI0.5 + Online Filtering (R25),10,85.0,400
+PI0.5 + Online Filtering (R25),15,81.75,400
+PI0.5 + Online Filtering (R25),20,75.75,400
+XVLA baseline (R25),0,97.5,400
+XVLA baseline (R25),5,53.5,400
+XVLA baseline (R25),10,45.25,400
+XVLA baseline (R25),15,46.0,400
+XVLA baseline (R25),20,46.25,400
+XVLA + Online Filtering (R25),0,95.25,400
+XVLA + Online Filtering (R25),5,80.0,400
+XVLA + Online Filtering (R25),10,71.5,400
+XVLA + Online Filtering (R25),15,66.5,400
+XVLA + Online Filtering (R25),20,67.0,400
